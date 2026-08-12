@@ -1,0 +1,26 @@
+# Binaries
+/flexbraid
+/flexbraid.exe
+/bin/
+/dist/
+
+# Go build/test artifacts
+*.test
+*.out
+coverage.*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local config (never commit secrets)
+/config.yaml
+/config.yml
+*.local.yaml
+
+# Logs
+*.log
+logs/

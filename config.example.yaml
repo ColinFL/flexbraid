@@ -1,0 +1,58 @@
+# FlexBraid example configuration.
+# Copy to config.yaml (or client.yaml / server.yaml) and edit.
+# Full reference: docs/CONFIG.md
+
+mode: client            # "client" | "server"
+listen: 0.0.0.0:51820   # client: where inner traffic (WireGuard) points at.
+                        # server: where FlexBraid clients connect.
+server: 203.0.113.1:4096   # (client only) FlexBraid server address:port
+session_id: auto        # "auto" (random) | <hex>; server keys sessions by this,
+                        # NOT by source IP — the basis of seamless failover.
+
+# --- scheduler -----------------------------------------------------------
+scheduler:
+  mode: lb              # "lb" (active load balance) | "standby" (warm standby)
+  balance_by: capacity  # lb only: "capacity" | "fec" | "roundrobin"
+
+# --- forward error correction (can be fully disabled) --------------------
+fec:
+  enabled: true
+  mode: adaptive        # "adaptive" | "fixed" | "off"
+  max_loss_pct: 20      # compensable random-loss % per path (0–90)
+  block_timeout_ms: 8   # block collection window; adds latency
+  fixed_overhead_pct: 25  # used only when mode: fixed
+
+# --- WANs: one entry per physical uplink (any number) --------------------
+wans:
+  - id: w1
+    transport: faketcp  # "udp" | "faketcp" | "icmp"
+    iface: igc1         # bind device (optional)
+    capacity_mbps: 300  # declared bandwidth → drives capacity-weighted balancing
+    weight: 1.0
+    # fec_max_loss_pct: 20   # optional per-path FEC override
+
+  - id: w2
+    transport: udp
+    iface: igc0
+    capacity_mbps: 100
+    weight: 1.0
+
+# --- health: monitoring & circuit breaker --------------------------------
+health:
+  loss_alpha_fast: 0.4   # fast-rise EWMA weight (reacts to spikes)
+  loss_alpha_slow: 0.03  # slow-decay EWMA weight (settles slowly)
+  jitter_alpha: 0.1
+  degrade_sec: 3         # sustained loss above FEC cap → DEGRADED
+  down_grace_sec: 1      # drain window before hard disable
+  recover_min: 2         # stability window before a path is restored
+  probe_interval: 5      # active keepalive period while DOWN
+
+# --- crypto --------------------------------------------------------------
+crypto:
+  key: ""                     # shared secret; empty = ephemeral (server issues)
+  cipher: chacha20poly1305    # "chacha20poly1305" | "aes256gcm"
+
+# --- logging -------------------------------------------------------------
+log:
+  level: info   # debug | info | warn | error
+  file: ""
