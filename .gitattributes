@@ -1,0 +1,13 @@
+# Normalise line endings so the repo stays LF-clean regardless of OS.
+* text=auto
+
+*.go     text eol=lf
+*.md     text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+Makefile text eol=lf
+*.sh     text eol=lf
+
+*.png    binary
+*.jpg    binary
+*.ico    binary
