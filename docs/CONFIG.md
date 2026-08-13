@@ -158,3 +158,15 @@ log:
   level: info   # debug | info | warn | error
   file: ""      # empty = stderr
 ```
+
+---
+
+## Reserved (parsed, not yet used)
+
+These options are validated and accepted but have no effect until a later
+milestone:
+
+- `session_id` — the client currently always generates a random session ID;
+  pinning a fixed ID is for M4+ (multi-client / stable NAT identity).
+- `mtu` — the inner MTU is not yet advertised to WireGuard (the admin sets
+  the WG interface MTU manually in M1/M2); honoured in M6.

@@ -49,23 +49,32 @@ func main() {
 	defer stop()
 
 	var run func(context.Context) error
+	var start func() error
 	switch cfg.Mode {
 	case config.ModeClient:
 		var c *tunnel.Client
 		c, err = tunnel.NewClient(cfg, logger)
 		if err == nil {
+			start = c.Start
 			run = c.Run
 		}
 	case config.ModeServer:
 		var s *tunnel.Server
 		s, err = tunnel.NewServer(cfg, logger)
 		if err == nil {
+			start = s.Start
 			run = s.Run
 		}
 	default:
 		err = fmt.Errorf("unknown mode %q", cfg.Mode)
 	}
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "flexbraid: %v\n", err)
+		os.Exit(1)
+	}
+	// Start binds sockets synchronously so init errors (busy port, bad
+	// address) surface before any goroutine is spawned.
+	if err := start(); err != nil {
 		fmt.Fprintf(os.Stderr, "flexbraid: %v\n", err)
 		os.Exit(1)
 	}

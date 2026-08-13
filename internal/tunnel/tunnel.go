@@ -10,6 +10,10 @@
 // Multi-WAN scheduling, FEC and health monitoring land in M2/M3; the
 // interfaces here are already shaped for them (Transport per WAN, per-path
 // endpoints in session).
+//
+// Lifecycle: Start() binds all sockets and returns init errors synchronously
+// (port busy, bad address); Run(ctx) then starts the goroutines and blocks.
+// Socket fields are read-only after Start, so no locking is needed for them.
 package tunnel
 
 import (
@@ -36,28 +40,24 @@ const (
 	recvBufSize = 65535
 )
 
-func mustUDPAddr(s string) *net.UDPAddr {
+func resolveUDPAddr(s string) (*net.UDPAddr, error) {
 	addr, err := net.ResolveUDPAddr("udp", s)
 	if err != nil {
-		panic(fmt.Sprintf("resolve %q: %v", s, err))
+		return nil, fmt.Errorf("resolve %q: %w", s, err)
 	}
-	return addr
-}
-
-// channel carries the AEAD plus the direction context for one side.
-type channel struct {
-	aead cipher.AEAD
-	dir  crypto.NonceDirection
+	return addr, nil
 }
 
 // Client is the FlexBraid tunnel client (office side).
 type Client struct {
-	cfg     *config.Config
-	log     *slog.Logger
-	ch      channel
-	sess    *session.Client
-	wanTr   transport.Transport
-	ingress *net.UDPConn
+	cfg      *config.Config
+	log      *slog.Logger
+	baseAEAD cipher.AEAD // handshake key (derived from PSK only)
+	sessAEAD cipher.AEAD // per-session key (derived from PSK + session ID)
+	sess     *session.Client
+	wanTr    transport.Transport
+
+	ingress *net.UDPConn // read-only after Start
 }
 
 // NewClient builds a tunnel client from config.
@@ -75,36 +75,63 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		log.Warn("M1 uses only the first WAN; multi-WAN scheduling arrives in M3",
 			"configured", len(cfg.WANs))
 	}
-	ch, err := newChannel(cfg)
+
+	baseKey, err := crypto.DeriveKey([]byte(cfg.Crypto.Key))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("derive key: %w", err)
 	}
-	sess, err := session.NewClient()
+	baseAEAD, err := crypto.NewAEAD(baseKey, cfg.Crypto.Cipher)
+	if err != nil {
+		return nil, fmt.Errorf("cipher: %w", err)
+	}
+
+	// The session ID is chosen before the session key exists; both sides
+	// derive the same per-session key from (PSK, session ID).
+	id, err := session.NewID()
 	if err != nil {
 		return nil, fmt.Errorf("session: %w", err)
 	}
+	sessKey := crypto.DeriveSessionKey([]byte(cfg.Crypto.Key), uint64(id))
+	sessAEAD, err := crypto.NewAEAD(sessKey, cfg.Crypto.Cipher)
+	if err != nil {
+		return nil, fmt.Errorf("session cipher: %w", err)
+	}
+
 	wan := cfg.WANs[0]
 	return &Client{
-		cfg:   cfg,
-		log:   log,
-		ch:    ch,
-		sess:  sess,
-		wanTr: transport.NewUDP(wan.ID, "", cfg.Server),
+		cfg:      cfg,
+		log:      log,
+		baseAEAD: baseAEAD,
+		sessAEAD: sessAEAD,
+		sess:     session.NewClientWithID(id),
+		wanTr:    transport.NewUDP(wan.ID, "", cfg.Server),
 	}, nil
 }
 
-// Run starts the client and blocks until ctx is cancelled.
-func (c *Client) Run(ctx context.Context) error {
-	var err error
-	c.ingress, err = net.ListenUDP("udp", mustUDPAddr(c.cfg.Listen))
+// Start binds the ingress socket and opens the WAN transport. It must be
+// called before Run and returns init errors (e.g. port busy) synchronously.
+func (c *Client) Start() error {
+	ingressAddr, err := resolveUDPAddr(c.cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("ingress address: %w", err)
+	}
+	ingress, err := net.ListenUDP("udp", ingressAddr)
 	if err != nil {
 		return fmt.Errorf("ingress listen %s: %w", c.cfg.Listen, err)
 	}
-	defer c.ingress.Close()
+	c.ingress = ingress
 
 	if err := c.wanTr.Open(); err != nil {
+		ingress.Close()
 		return err
 	}
+	return nil
+}
+
+// Run starts the client loops and blocks until ctx is cancelled. Call Start
+// first.
+func (c *Client) Run(ctx context.Context) error {
+	defer c.ingress.Close()
 	defer c.wanTr.Close()
 
 	c.log.Info("client started",
@@ -113,7 +140,6 @@ func (c *Client) Run(ctx context.Context) error {
 		"server", c.cfg.Server,
 		"wan", c.wanTr.ID())
 
-	// Periodic FIRST handshake (also keeps the NAT mapping warm).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go c.handshakeLoop(ctx)
@@ -124,13 +150,13 @@ func (c *Client) Run(ctx context.Context) error {
 		c.recvLoop()
 	}()
 
-	err = c.ingressLoop(ctx)
+	err := c.ingressLoop(ctx)
 	c.wanTr.Close() // unblocks recvLoop
 	<-recvDone
 	return err
 }
 
-// LocalAddr returns the client's ingress address (nil before Run).
+// LocalAddr returns the client's ingress address (valid after Start).
 func (c *Client) LocalAddr() *net.UDPAddr {
 	if c.ingress == nil {
 		return nil
@@ -139,7 +165,8 @@ func (c *Client) LocalAddr() *net.UDPAddr {
 }
 
 // handshakeLoop sends the FIRST frame immediately and then every
-// handshakeInterval.
+// handshakeInterval. FIRST frames are sealed with the *base* key — the
+// server has no session yet, so it cannot know the per-session key.
 func (c *Client) handshakeLoop(ctx context.Context) {
 	send := func() {
 		f := &frame.Frame{
@@ -147,7 +174,7 @@ func (c *Client) handshakeLoop(ctx context.Context) {
 			SessionID: uint64(c.sess.ID),
 			Seq:       c.sess.NextSeq(),
 		}
-		if err := c.send(f); err != nil {
+		if err := c.send(f, c.baseAEAD); err != nil {
 			c.log.Warn("handshake send failed", "error", err)
 		}
 	}
@@ -165,12 +192,12 @@ func (c *Client) handshakeLoop(ctx context.Context) {
 }
 
 // send seals and transmits one frame over the WAN transport.
-func (c *Client) send(f *frame.Frame) error {
+func (c *Client) send(f *frame.Frame, aead cipher.AEAD) error {
 	plain, err := f.Encode()
 	if err != nil {
 		return err
 	}
-	sealed, err := crypto.Seal(c.ch.aead, c.ch.dir, plain)
+	sealed, err := crypto.Seal(aead, crypto.DirClientToServer, plain)
 	if err != nil {
 		return err
 	}
@@ -198,7 +225,7 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 			Seq:       c.sess.NextSeq(),
 			Payload:   payload,
 		}
-		if err := c.send(f); err != nil {
+		if err := c.send(f, c.sessAEAD); err != nil {
 			c.log.Warn("send failed", "error", err)
 		}
 	}
@@ -211,12 +238,8 @@ func (c *Client) recvLoop() {
 		if err != nil {
 			return // transport closed
 		}
-		plain, ok := c.openAndVerify(sealed, crypto.DirServerToClient)
+		f, ok := c.openAndVerify(sealed)
 		if !ok {
-			continue
-		}
-		f, err := frame.Decode(plain)
-		if err != nil {
 			continue
 		}
 		// Control/keepalive frames carry no inner data; M3 uses them for RTT.
@@ -233,30 +256,28 @@ func (c *Client) recvLoop() {
 	}
 }
 
-// openAndVerify runs the receive pipeline: header check → anti-replay → AEAD.
-func (c *Client) openAndVerify(sealed []byte, dir crypto.NonceDirection) ([]byte, bool) {
+// openAndVerify runs the receive pipeline in the security-correct order:
+// header check → AEAD authentication → anti-replay. The seq is part of the
+// authenticated header, so an unauthenticated attacker cannot slide the
+// replay window (window poisoning would be a permanent DoS).
+func (c *Client) openAndVerify(sealed []byte) (*frame.Frame, bool) {
 	hdr, err := frame.DecodeHeader(sealed)
 	if err != nil {
 		return nil, false
 	}
-	if !c.sess.CheckReplay(hdr.Seq) {
-		return nil, false
+	if hdr.SessionID != uint64(c.sess.ID) {
+		return nil, false // wrong session — per-session key would also fail
 	}
-	plain, err := crypto.Open(c.ch.aead, dir, sealed)
+	plain, err := crypto.Open(c.sessAEAD, crypto.DirServerToClient, sealed)
 	if err != nil {
 		return nil, false
 	}
-	return plain, true
-}
-
-func newChannel(cfg *config.Config) (channel, error) {
-	key, err := crypto.DeriveKey([]byte(cfg.Crypto.Key))
+	f, err := frame.Decode(plain)
 	if err != nil {
-		return channel{}, fmt.Errorf("derive key: %w", err)
+		return nil, false
 	}
-	aead, err := crypto.NewAEAD(key, cfg.Crypto.Cipher)
-	if err != nil {
-		return channel{}, fmt.Errorf("cipher: %w", err)
+	if !c.sess.CheckReplay(f.Seq) {
+		return nil, false
 	}
-	return channel{aead: aead, dir: crypto.DirClientToServer}, nil
+	return f, true
 }

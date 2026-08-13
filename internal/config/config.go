@@ -10,6 +10,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 
@@ -202,6 +203,20 @@ func (c *Config) Validate() error {
 	}
 	if c.Mode == ModeServer && c.WGPeer == "" {
 		return fmt.Errorf("server requires wg_peer (inner WireGuard peer address)")
+	}
+	// Addresses must parse, or Start() would have to panic.
+	if _, err := net.ResolveUDPAddr("udp", c.Listen); err != nil {
+		return fmt.Errorf("invalid listen address %q: %w", c.Listen, err)
+	}
+	if c.Mode == ModeClient {
+		if _, err := net.ResolveUDPAddr("udp", c.Server); err != nil {
+			return fmt.Errorf("invalid server address %q: %w", c.Server, err)
+		}
+	}
+	if c.Mode == ModeServer {
+		if _, err := net.ResolveUDPAddr("udp", c.WGPeer); err != nil {
+			return fmt.Errorf("invalid wg_peer address %q: %w", c.WGPeer, err)
+		}
 	}
 	if c.SessionID == "" {
 		c.SessionID = "auto"

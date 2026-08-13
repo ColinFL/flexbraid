@@ -1,14 +1,29 @@
 package session
 
 import (
+	"crypto/cipher"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/ColinFL/flexbraid/internal/crypto"
 )
 
+func testAEAD(t *testing.T) cipher.AEAD {
+	t.Helper()
+	key, err := crypto.DeriveKey([]byte("test-psk"))
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	aead, err := crypto.NewAEAD(key, "chacha20poly1305")
+	if err != nil {
+		t.Fatalf("aead: %v", err)
+	}
+	return aead
+}
+
 func TestPerPathEndpoints(t *testing.T) {
-	s := NewServerSession(42)
+	s := NewServerSession(42, testAEAD(t))
 
 	s.SetEndpoint("w1", &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1111})
 	s.SetEndpoint("w2", &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 2222})
@@ -28,7 +43,7 @@ func TestPerPathEndpoints(t *testing.T) {
 }
 
 func TestReplayWindowRejectsReplaysAndOldSeqs(t *testing.T) {
-	s := NewServerSession(1)
+	s := NewServerSession(1, testAEAD(t))
 
 	if !s.CheckReplay(1) || !s.CheckReplay(2) || !s.CheckReplay(3) {
 		t.Fatal("fresh seqs must be accepted")
@@ -56,17 +71,51 @@ func TestReplayWindowRejectsReplaysAndOldSeqs(t *testing.T) {
 	}
 }
 
-func TestManagerGetOrCreate(t *testing.T) {
+func TestManagerPutGetDelete(t *testing.T) {
 	m := NewManager()
-	a := m.GetOrCreate(7)
-	b := m.GetOrCreate(7)
-	if a != b {
-		t.Fatal("GetOrCreate must return the same session for the same ID")
+	s := NewServerSession(7, testAEAD(t))
+	m.Put(s)
+	if m.Get(7) != s {
+		t.Fatal("Get must return the stored session")
 	}
-	if m.Get(8) != nil {
-		t.Fatal("unknown session must be nil")
+	if m.Count() != 1 {
+		t.Fatalf("want 1 session, got %d", m.Count())
 	}
-	if len(m.All()) != 1 {
-		t.Fatalf("want 1 session, got %d", len(m.All()))
+	m.Delete(7)
+	if m.Get(7) != nil {
+		t.Fatal("session must be gone after Delete")
+	}
+	if m.Count() != 0 {
+		t.Fatalf("want 0 sessions, got %d", m.Count())
+	}
+}
+
+func TestManagerExpire(t *testing.T) {
+	m := NewManager()
+	m.Put(NewServerSession(1, testAEAD(t)))
+	m.Put(NewServerSession(2, testAEAD(t)))
+
+	// Negative TTL: cutoff is in the future, so every session is idle.
+	// (A zero TTL is unreliable: time.Now() has ~100ns resolution on
+	// Windows, and the sessions may have been created in the same tick.)
+	if n := m.Expire(-time.Second); n != 2 {
+		t.Fatalf("want 2 expired, got %d", n)
+	}
+	if m.Count() != 0 {
+		t.Fatalf("want 0 sessions after expire, got %d", m.Count())
+	}
+}
+
+func TestManagerExpireKeepsFresh(t *testing.T) {
+	m := NewManager()
+	s := NewServerSession(1, testAEAD(t))
+	m.Put(s)
+
+	// Fresh session (created just now) must survive a long TTL.
+	if n := m.Expire(time.Hour); n != 0 {
+		t.Fatalf("fresh session expired: %d", n)
+	}
+	if m.Get(1) == nil {
+		t.Fatal("fresh session lost")
 	}
 }

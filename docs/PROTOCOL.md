@@ -143,6 +143,17 @@ messages; wire numbering is reserved here and documented there.
   derived from `crypto.key`. There is **no unauthenticated ephemeral-key path**:
   without a shared secret nothing prevents a MITM from impersonating either
   side. (Authenticated key-exchange is a roadmap item, not v1.)
+- **Per-session keys:** the handshake (FIRST/SESSION_ACK) uses the *base* key
+  HKDF(PSK, "channel-key"). Once the server has authenticated a FIRST frame
+  it derives the *session* key HKDF(PSK, "session:"+session_id), and every
+  later frame in both directions uses it. This guarantees a (dir, seq) nonce
+  is never reused under the same key across sessions — AEAD nonce reuse
+  would be catastrophic.
+- **Authentication before state:** frames are AEAD-authenticated **before**
+  the replay window is touched and before session state is created or
+  updated. An unauthenticated attacker therefore cannot slide the replay
+  window (window poisoning → permanent DoS) nor grow the session table
+  (memory DoS).
 - **Authentication / integrity:** the AEAD tag (or the Poly1305 MAC in
   `crypto.integrity_only` mode) authenticates header + payload, including
   `session_id`, so a forged/hijacked session cannot inject frames without the

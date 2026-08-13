@@ -450,15 +450,19 @@ so new wire formats are drop-in.
   AES-NI, matches WireGuard's own primitives). AES-256-GCM available.
   *(Upgrade over udp2raw's AES-CBC + HMAC-SHA1.)*
 - **Keying: always a shared pre-shared key (PSK) from config (`crypto.key`).**
-  AEAD keys are derived from it. There is **no unauthenticated "ephemeral key
-  from the server" path** — without a shared secret nothing stops a MITM from
-  impersonating either side. (A proper X25519 + signature key-exchange for
-  forward secrecy is a future roadmap item, not v1.)
+  The handshake (FIRST/SESSION_ACK) uses the base key; after the handshake
+  both sides derive a **per-session key** from (PSK, session_id), so a nonce
+  is never reused across sessions. There is **no unauthenticated "ephemeral
+  key from server" path** — without a shared secret there is nothing to stop a
+  MITM from impersonating either side. (A proper X25519/signature key-exchange
+  for forward secrecy is a future roadmap item.)
 - **Authentication / integrity:** the AEAD tag over header+payload
   authenticates the `session_id`, so a forged or hijacked session cannot inject
   frames without the key. The anti-replay sliding window rejects replayed
   `seq`s and is sized **≥ the delivery-buffer window** (§5) so it never drops
-  legitimate frames that multi-path delivery reordered.
+  legitimate frames that multi-path delivery reordered. Frames are
+  **authenticated before** the replay window is touched, so an unauthenticated
+  attacker cannot poison it (window poisoning would be a permanent DoS).
 - **`crypto.integrity_only` (optional):** because WireGuard already encrypts the
   inner data, this mode authenticates the plaintext with a Poly1305 MAC instead
   of full AEAD — same integrity, less CPU on high-throughput links.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"time"
 
 	"github.com/ColinFL/flexbraid/internal/config"
 	"github.com/ColinFL/flexbraid/internal/crypto"
@@ -14,16 +15,26 @@ import (
 	"github.com/ColinFL/flexbraid/internal/transport"
 )
 
+const (
+	// sessionTTL drops sessions with no authenticated traffic for this long.
+	sessionTTL = 5 * time.Minute
+	// sessionSweepInterval is how often the sweeper runs.
+	sessionSweepInterval = 30 * time.Second
+	// maxSessions caps the session table (anti-DoS bound).
+	maxSessions = 1024
+)
+
 // Server is the FlexBraid tunnel server (VPS side). It accepts sessions from
 // clients over the WAN transport and forwards inner datagrams to the
 // WireGuard peer over a connected egress socket.
 type Server struct {
-	cfg    *config.Config
-	log    *slog.Logger
-	aead   cipher.AEAD
-	mgr    *session.Manager
-	wanTr  transport.Transport
-	egress *net.UDPConn
+	cfg      *config.Config
+	log      *slog.Logger
+	psk      []byte // raw PSK, used to derive per-session keys
+	baseAEAD cipher.AEAD
+	mgr      *session.Manager
+	wanTr    transport.Transport
+	egress   *net.UDPConn // read-only after Start
 }
 
 // NewServer builds a tunnel server from config.
@@ -34,40 +45,60 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	if cfg.WGPeer == "" {
 		return nil, fmt.Errorf("server requires wg_peer (inner WireGuard peer address)")
 	}
-	key, err := crypto.DeriveKey([]byte(cfg.Crypto.Key))
+	baseKey, err := crypto.DeriveKey([]byte(cfg.Crypto.Key))
 	if err != nil {
 		return nil, fmt.Errorf("derive key: %w", err)
 	}
-	aead, err := crypto.NewAEAD(key, cfg.Crypto.Cipher)
+	baseAEAD, err := crypto.NewAEAD(baseKey, cfg.Crypto.Cipher)
 	if err != nil {
 		return nil, fmt.Errorf("cipher: %w", err)
 	}
 	return &Server{
-		cfg:   cfg,
-		log:   log,
-		aead:  aead,
-		mgr:   session.NewManager(),
-		wanTr: transport.NewUDP("wan", cfg.Listen, ""),
+		cfg:      cfg,
+		log:      log,
+		psk:      []byte(cfg.Crypto.Key),
+		baseAEAD: baseAEAD,
+		mgr:      session.NewManager(),
+		wanTr:    transport.NewUDP("wan", cfg.Listen, ""),
 	}, nil
 }
 
-// Run starts the server and blocks until ctx is cancelled.
-func (s *Server) Run(ctx context.Context) error {
+// Start binds the WAN listen socket and dials the egress (WG peer). It must
+// be called before Run and returns init errors synchronously.
+func (s *Server) Start() error {
 	if err := s.wanTr.Open(); err != nil {
 		return fmt.Errorf("wan listen: %w", err)
 	}
-	defer s.wanTr.Close()
-
-	egress, err := net.DialUDP("udp", nil, mustUDPAddr(s.cfg.WGPeer))
+	egressAddr, err := resolveUDPAddr(s.cfg.WGPeer)
 	if err != nil {
+		s.wanTr.Close()
+		return fmt.Errorf("wg_peer address: %w", err)
+	}
+	egress, err := net.DialUDP("udp", nil, egressAddr)
+	if err != nil {
+		s.wanTr.Close()
 		return fmt.Errorf("egress dial %s: %w", s.cfg.WGPeer, err)
 	}
 	s.egress = egress
-	defer egress.Close()
+	return nil
+}
+
+// Run starts the server loops and blocks until ctx is cancelled. Call Start
+// first.
+func (s *Server) Run(ctx context.Context) error {
+	defer s.wanTr.Close()
+	defer s.egress.Close()
 
 	s.log.Info("server started",
 		"listen", s.cfg.Listen,
 		"wg_peer", s.cfg.WGPeer)
+
+	// Session TTL sweeper.
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		s.sweepLoop(ctx)
+	}()
 
 	// Inner replies (WG → client) arrive on the egress socket; fan them out
 	// to every known session endpoint.
@@ -77,15 +108,32 @@ func (s *Server) Run(ctx context.Context) error {
 		s.egressLoop()
 	}()
 
-	err = s.wanLoop(ctx)
-	s.wanTr.Close() // unblocks nothing on egress, but keeps cleanup tidy
+	err := s.wanLoop(ctx)
+	s.wanTr.Close()
 	s.egress.Close()
 	<-egressDone
+	<-sweepDone
 	return err
 }
 
-// LocalAddr returns the server's WAN listen address (nil before Run).
+// LocalAddr returns the server's WAN listen address (valid after Start).
 func (s *Server) LocalAddr() net.Addr { return s.wanTr.LocalAddr() }
+
+// sweepLoop periodically expires idle sessions.
+func (s *Server) sweepLoop(ctx context.Context) {
+	t := time.NewTicker(sessionSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if n := s.mgr.Expire(sessionTTL); n > 0 {
+				s.log.Info("expired idle sessions", "count", n)
+			}
+		}
+	}
+}
 
 // wanLoop receives client frames on the WAN transport.
 func (s *Server) wanLoop(ctx context.Context) error {
@@ -102,6 +150,11 @@ func (s *Server) wanLoop(ctx context.Context) error {
 }
 
 // handleClientFrame processes one frame from a client endpoint.
+//
+// Security order (see docs/DESIGN.md §11): the frame is authenticated before
+// anything stateful happens — the replay window, session table and endpoints
+// are only touched for frames that passed AEAD. Otherwise an attacker could
+// poison the replay window or grow the session table with forged packets.
 func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 	hdr, err := frame.DecodeHeader(sealed)
 	if err != nil {
@@ -109,37 +162,58 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 	}
 	id := session.ID(hdr.SessionID)
 
-	// FIRST: (re)establish the session and answer with an ACK.
+	// FIRST: handshake — authenticated with the base key (the per-session
+	// key does not exist until the session does).
 	if hdr.HasFlag(frame.FlagFirst) {
-		sess := s.mgr.GetOrCreate(id)
-		if !sess.CheckReplay(hdr.Seq) {
-			return
-		}
-		if _, err := crypto.Open(s.aead, crypto.DirClientToServer, sealed); err != nil {
-			s.log.Warn("handshake failed auth", "session", fmt.Sprintf("%016x", uint64(id)))
-			return
-		}
 		ua, _ := addr.(*net.UDPAddr)
+		if ua == nil {
+			return
+		}
+		// Authenticate before any state change.
+		if _, err := crypto.Open(s.baseAEAD, crypto.DirClientToServer, sealed); err != nil {
+			return // unauthenticated handshake — drop
+		}
+		sess := s.mgr.Get(id)
+		if sess == nil {
+			if s.mgr.Count() >= maxSessions {
+				s.log.Warn("session table full, dropping handshake",
+					"session", fmt.Sprintf("%016x", uint64(id)))
+				return
+			}
+			sessKey := crypto.DeriveSessionKey(s.psk, uint64(id))
+			sessAEAD, err := crypto.NewAEAD(sessKey, s.cfg.Crypto.Cipher)
+			if err != nil {
+				return
+			}
+			sess = session.NewServerSession(id, sessAEAD)
+			s.mgr.Put(sess)
+		}
+		if !sess.CheckReplay(hdr.Seq) {
+			return // replayed handshake
+		}
+		sess.Touch()
 		sess.SetEndpoint(s.wanTr.ID(), ua)
 		s.sendAck(sess, ua)
 		return
 	}
 
+	// Data frame: session must exist and be authenticated with its key.
 	sess := s.mgr.Get(id)
 	if sess == nil {
 		return // unknown session, drop
 	}
-	if !sess.CheckReplay(hdr.Seq) {
-		return
-	}
-	plain, err := crypto.Open(s.aead, crypto.DirClientToServer, sealed)
+	plain, err := crypto.Open(sess.AEAD(), crypto.DirClientToServer, sealed)
 	if err != nil {
 		return // auth failure / tampering
+	}
+	if !sess.CheckReplay(hdr.Seq) {
+		return
 	}
 	f, err := frame.Decode(plain)
 	if err != nil {
 		return
 	}
+	sess.Touch()
 	ua, _ := addr.(*net.UDPAddr)
 	if ua != nil {
 		sess.SetEndpoint(s.wanTr.ID(), ua) // keep the path fresh
@@ -152,7 +226,8 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 	}
 }
 
-// sendAck answers a FIRST frame with a CONTROL ACK on the same path.
+// sendAck answers a FIRST frame with a CONTROL ACK on the same path, sealed
+// with the session key.
 func (s *Server) sendAck(sess *session.ServerSession, addr *net.UDPAddr) {
 	f := &frame.Frame{
 		Flags:     frame.FlagControl,
@@ -163,7 +238,7 @@ func (s *Server) sendAck(sess *session.ServerSession, addr *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	sealed, err := crypto.Seal(s.aead, crypto.DirServerToClient, plain)
+	sealed, err := crypto.Seal(sess.AEAD(), crypto.DirServerToClient, plain)
 	if err != nil {
 		return
 	}
@@ -194,7 +269,7 @@ func (s *Server) egressLoop() {
 				if err != nil {
 					continue
 				}
-				sealed, err := crypto.Seal(s.aead, crypto.DirServerToClient, plain)
+				sealed, err := crypto.Seal(sess.AEAD(), crypto.DirServerToClient, plain)
 				if err != nil {
 					continue
 				}
