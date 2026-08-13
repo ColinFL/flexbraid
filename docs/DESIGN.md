@@ -1,6 +1,6 @@
 # FlexBraid — Design Document
 
-> **Status:** Draft v0.1 · **Author:** ColinFL · **License:** MIT
+> **Status:** Draft v0.2 (design decisions incorporated) · **Author:** ColinFL · **License:** MIT
 > Companion documents: [ARCHITECTURE.md](ARCHITECTURE.md) · [PROTOCOL.md](PROTOCOL.md) · [CONFIG.md](CONFIG.md)
 
 ---
@@ -74,14 +74,37 @@ The contract FlexBraid presents to the inner layer is the key design decision:
 
 To honour this, the FlexBraid data path guarantees the inner layer:
 - **bounded loss** — erased/repaired by FEC;
-- **in-order delivery** — enforced by a reorder buffer on the server side;
-- **bounded jitter** — a configurable jitter buffer absorbs the switch;
+- **in-order delivery** — enforced by a single *delivery buffer* (reorder +
+  jitter in one window) on the server side;
+- **bounded jitter** — the delivery buffer's tunable window absorbs the switch;
 - **stable session identity** — sessions are keyed by a random `session_id`,
   **not** by the client's source IP, so moving between WANs (which changes the
-  NAT mapping) does not tear the session down.
+  NAT mapping) does not tear the session down;
+- **per-path endpoints** — in load-balance mode the server tracks a return
+  address per WAN and answers on the same path, so several uplinks can be
+  active at once (§9).
 
 This is what lets WireGuard sit on top unchanged: WG keeps one peer, one
 handshake, one endpoint — FlexBraid handles everything underneath.
+
+### 3.1 Deployment topology
+Two supported topologies:
+- **(a) Co-located egress (recommended):** the WireGuard peer lives on the
+  same host as the FlexBraid server (e.g. on the VPS); FlexBraid delivers
+  reordered inner datagrams to WG over loopback, WG egresses to the internet.
+  Simple, lowest latency, and matches the "office egresses via VPS" use case.
+- **(b) Relay:** the FlexBraid server forwards inner datagrams to a WG peer
+  elsewhere. Possible, but the inner path is no longer loopback; the design
+  does not optimise for this initially.
+
+### 3.2 Latency & reliability budget
+Explicit targets that sizing must respect:
+| Parameter | Budget |
+|---|---|
+| WAN failover (detect → switch) | **< 300 ms** (sub-second, inside TCP RTO and game session timeouts) |
+| Delivery-buffer window | ~10 ms of buffering (tunable), sized ≥ inter-path latency skew + jitter |
+| FEC `block_timeout_ms` | default 8 ms (adds at most this much latency) |
+| Whole-WAN zero-loss survival | only via optional cross-path FEC, at capacity cost (never free) |
 
 ---
 
@@ -124,12 +147,11 @@ handshake, one endpoint — FlexBraid handles everything underneath.
 |---|---|
 | **Ingress listener** | One UDP socket the inner layer points at. |
 | **Sequence / session** | Assigns a monotonically increasing sequence number and the stable `session_id` to every frame. |
-| **FEC encoder / decoder** | Reed–Solomon erasure coding across a block of frames (see §6). |
+| **FEC encoder / decoder** | Reed–Solomon erasure coding over **per-WAN** blocks of frames (see §6). |
 | **Scheduler** | Splits the coded frame stream across healthy WANs (see §7). |
-| **Transport (per WAN)** | Pluggable wire format: `udp`, `faketcp`, `icmp`; handles encryption/auth per frame; owns the per-WAN socket. |
-| **Reorder buffer** | On the server, restores order from the interleaved multi-path stream. |
-| **Jitter buffer** | Smooths delivery latency for latency-sensitive inner traffic. |
-| **Session manager** | Keys sessions by `session_id`; survives endpoint changes. |
+| **Transport (per WAN)** | Pluggable wire format: `udp`, `faketcp`, `icmp`; handles encryption/auth per frame; owns the per-WAN socket and its send queue. |
+| **Delivery buffer** | One combined reorder + jitter buffer on the server that restores global `seq` order and smooths latency before egress. |
+| **Session manager** | Keys sessions by `session_id`; maintains **per-path endpoints**; survives endpoint changes. |
 | **Health monitor** | Per-path loss/RTT/jitter estimation + circuit-breaker state machine (see §8). |
 | **Telemetry / control** | Per-path stats, logging, runtime reconfiguration (SIGUSR1 reload, FIFO). |
 
@@ -155,12 +177,20 @@ frame layout (client → server and server → client are symmetric):
   server uses it as the *only* identity for the tunnel. Source IP/port changes
   are ignored for session lookup → endpoint migration is seamless.
 - **`seq`** — global, monotonically increasing across all WANs. Used by the
-  reorder buffer and by FEC block grouping.
+  delivery (reorder) buffer to restore order at the server.
 - **`flags`** — bit 0: `FEC_PARITY` (this frame is a parity frame, not inner
-  data); bit 1: `KEEPALIVE`; bit 2: `CONTROL` (telemetry/control channel).
-- FEC operates on a **block** of consecutive `seq`s. With `n` total frames per
-  block and `n−k` parity, the block is recoverable if at least `k` of the `n`
-  frames arrive.
+  data); bit 1: `KEEPALIVE`; bit 2: `CONTROL` (control/RTT channel).
+- **FEC blocks are built per WAN** — each path encodes *its own* frames into
+  self-contained RS blocks (data + parity on the same path). This keeps
+  within-path FEC coherent regardless of scheduler; cross-path FEC is a
+  separate optional layer (§6.4). Within a block, `n` total frames of which
+  `n−k` are parity; the block is recoverable if at least `k` arrive.
+- **Anti-replay window ≥ delivery-buffer window** — a hard invariant so the
+  replay filter never drops legitimate frames that the multi-path delivery
+  deliberately reordered. Window is sized to the delivery buffer plus margin.
+- **Control/RTT frames bypass FEC** — `CONTROL`/`KEEPALIVE` frames are sent
+  directly on the path (not erasure-coded), so keepalive round-trip time is a
+  clean RTT sample rather than one gated behind block decoding.
 
 ---
 
@@ -175,6 +205,12 @@ a little bandwidth to remove most of that.
 Reed–Solomon **erasure code** RS(`n`, `k`): `k` data frames + `n−k` parity
 frames per block. A block is fully recoverable if **at most `n−k` frames are
 lost**. This is the same code family UDPspeeder uses.
+
+**Blocks are constructed per WAN.** Each path's transport encodes *its own*
+outbound frames into self-contained blocks (data + parity travel on the same
+WAN). This is the fix for the FEC↔scheduler coupling (see §7.4): within-path
+FEC is always coherent, no matter how the scheduler spreads frames. The
+scheduler only ever hands frames to the FEC encoder of the chosen WAN.
 
 Maximum compensable random loss rate:
 ```
@@ -195,12 +231,13 @@ overhead = L / (1 − L)
 | 100% (whole WAN) | cross-path only | ∞ without cross-path FEC |
 
 **Hard limits to design for:**
-1. **FEC fixes random loss *within* a working path — it does not survive a full
-   path cutover.** When a WAN dies, its data *and* its parity die together.
-   Surviving a whole-WAN loss with zero drop requires **cross-path erasure
-   coding** (code across the aggregate so any surviving subset of WANs can
-   reconstruct). This is an **optional advanced mode** (§6.4) that costs
-   capacity proportional to the share you want to protect.
+1. **Per-WAN FEC fixes random loss *within* a working path — it does not survive
+   a full path cutover.** Because blocks are per-WAN, when a WAN dies its data
+   *and* its parity die together. Surviving a whole-WAN loss with zero drop
+   requires **cross-path erasure coding** (code across the aggregate so any
+   surviving subset of WANs can reconstruct). This is an **optional advanced
+   mode** (§6.4) that costs capacity proportional to the share you want to
+   protect.
 2. **FEC adds latency.** A block is only coded once `k` frames are collected
    (`block_timeout_ms`, default 8 ms). Larger `n` ⇒ more latency and more
    resilience to jitter.
@@ -221,12 +258,15 @@ target_overhead = clamp( L̂ / (1 − L̂) * (1 + safety_margin),
   along" first; the breaker handles sustained overload).
 
 ### 6.4 Optional: cross-path FEC
-A future mode where RS blocks are spread across **all** WANs such that the
-block is recoverable as long as a sufficient *fraction* of WANs survive. This
-is the only way to reach true zero-loss on whole-WAN cutover, and it costs
-capacity. Exposed as a knob: `fec.mode: crosspath` with a
+A mode where RS blocks are spread across **all** WANs such that the block is
+recoverable as long as a sufficient *fraction* of WANs survive. This is the
+only way to reach true zero-loss on whole-WAN cutover, and it costs capacity
+proportional to the share you protect. **It requires packet-level scheduling**
+(§7.2) — flow-affine scheduling would defeat it, since each flow's data must
+span multiple paths. Exposed as a knob: `fec.mode: crosspath` with a
 `protection_level` (0.0 = none … 1.0 = full single-WAN protection).
-**Default: off** — the common case (random loss + fast failover) does not need it.
+**Default: off** — the common case (random loss + fast failover) needs only
+per-WAN FEC plus the sub-second failover.
 
 ### 6.5 Disabling FEC entirely
 `fec.enabled: false` (or `fec.mode: off`) turns off all erasure coding. Frames
@@ -234,43 +274,81 @@ then carry no parity; the scheduler still works; failover still preserves
 connections; you simply accept the link's raw loss. Useful on clean links or
 for latency-critical low-bandwidth use.
 
+### 6.6 MTU & fragmentation
+FlexBraid advertises a **fixed MTU** to the inner layer (WireGuard) computed
+with headroom for every per-frame cost and the worst-case path:
+```
+inner_mtu = min_path_mtu − frame_header(24) − auth_tag(16) − max_fec_overhead − safety
+```
+- The frame header + AEAD tag + the *maximum* configured FEC parity overhead
+  must fit inside every WAN's path MTU.
+- The `DF` bit is set; FlexBraid **never fragments** coded frames in the
+  tunnel. Inner PMTUD (WireGuard handles this) adapts to the advertised MTU.
+- Per-path PMTU discovery is a future refinement (§10) for heterogeneous paths;
+  v1 uses a conservative fixed value (`mtu` config, default 1420).
+
 ---
 
 ## 7. Packet Scheduler (load balancer)
 
-Two modes, selectable via `scheduler.mode`.
+Two independent axes control how traffic is spread:
+- **`scheduler.mode`** — *how many* WANs carry data: `lb` (all healthy, default)
+  or `standby` (one hot, rest warm).
+- **`scheduler.affinity`** — *granularity*: `flow` (default) or `packet`.
 
-### 7.1 `lb` — active load balancing (default)
-Frames are spread across all healthy WANs. Two sub-strategies via
-`scheduler.balance_by`:
-- **`capacity` (default)** — each WAN receives a share proportional to its
-  declared `capacity_mbps` (bandwidth-aware). This is the setting the user
-  asked for: a 300 Mbps WAN carries ~3× a 100 Mbps WAN.
-  ```
-  share_i = weight_i * capacity_i / Σ(weight_j * capacity_j)
-  ```
-- **`fec`** — like `capacity`, but subtracts the adaptive FEC overhead from
-  each path's effective capacity first (paths with heavy FEC get a smaller
-  share).
-- **`roundrobin`** — ignores weights, rotates evenly (for equal links).
+### 7.1 `mode: lb` + `affinity: flow` (default)
+Inner flows (TCP 4-tuples, per-game-session UDP) are hashed onto a WAN via
+consistent hashing, so a connection sticks to one path while healthy (no
+intra-connection reordering). Shares are weighted by `balance_by`:
+- **`capacity` (default)** — `share_i = weight_i * capacity_i / Σ(weight_j * capacity_j)`
+  (bandwidth-aware: a 300 Mbps WAN carries ~3× a 100 Mbps one).
+- **`fec`** — subtract each path's adaptive FEC overhead before weighting
+  (heavy-FEC paths get a smaller share).
+- **`roundrobin`** — ignore weights, rotate evenly.
 
-**Per-connection consistency:** for flow-oriented inner traffic (TCP), the
-scheduler hashes on inner 4-tuple so a connection sticks to one WAN while
-healthy, avoiding intra-connection reordering. When a WAN is pulled, only its
-connections move — consistent hashing keeps the reshuffle minimal.
+When a WAN is pulled, only its flows move; consistent hashing keeps the
+reshuffle minimal. Because flows stay on one path, **per-WAN FEC blocks fully
+protect each flow's random loss** (§6.2).
 
-### 7.2 `standby` — warm standby
-One WAN is active (highest priority / weight), the rest are kept **warm**
-(transport up, keepalives flowing, FEC live) but carry no data. On failure the
-scheduler switches to the next warm standby. Because the standby is already a
-live, authenticated transport with the server, the switch is a near-instant
-data-plane change (no cold handshake). This is the "minimal loss, no load
-splitting" profile.
+### 7.2 `mode: lb` + `affinity: packet`
+Frames are distributed packet-by-packet across healthy WANs — the best profile
+for aggregate throughput of a few fat flows. Requires the server's delivery
+buffer to restore order. **Cross-path FEC (§6.4) is only meaningful in this
+mode**, because blocks span multiple paths.
 
-### 7.3 Graceful drain
-Before a degraded WAN is disabled, the scheduler **stops scheduling new flows**
-onto it and lets its in-flight frames drain (`health.down_grace_sec`). This
-reduces loss versus an abrupt cut.
+### 7.3 `mode: standby` — warm standby
+One WAN active (highest priority/weight); the rest kept **warm** (transport up,
+keepalives flowing, FEC live) but idle. On failure the scheduler switches to
+the next warm standby — a near-instant data-plane change, no cold handshake.
+The server keeps a per-path endpoint, so the switch needs no re-handshake.
+This is the "minimal loss, no load splitting" profile.
+
+### 7.4 FEC ↔ scheduler coupling (invariant)
+Within-path FEC is coherent only when a block stays on one path. Enforcement:
+- `affinity: flow` → **per-WAN FEC blocks** (data + parity on the same path).
+  Always coherent.
+- `affinity: packet` → per-WAN FEC is meaningless; use **cross-path FEC**
+  (§6.4) instead.
+The scheduler never splits a per-WAN FEC block across paths — it hands complete
+blocks to the chosen WAN's encoder.
+
+### 7.5 Graceful drain
+Before a degraded WAN is disabled, stop scheduling new flows onto it and let
+in-flight frames drain (`health.down_grace_sec`). Reduces loss versus an abrupt
+cut.
+
+### 7.6 Queueing & backpressure
+WireGuard has no congestion control, so FlexBraid owns the queue discipline:
+- **Bounded per-WAN send queue**, sized to a latency budget (BDP-aware), never
+  unbounded.
+- **Rate limiter** per WAN at its declared `capacity_mbps` (token bucket) so a
+  fast WAN cannot bufferbloat a slow one; scheduling weights are relative to
+  declared capacity.
+- **Drop policy on overflow:** `drop-oldest` for TCP-ish flows (loss is how TCP
+  learns to back off), `drop-newest` for real-time UDP (games want the latest
+  state). Configurable.
+- **No full backpressure to the ingress:** WG/UDP cannot be throttled upstream,
+  so backpressure would only add latency, not remove load.
 
 ---
 
@@ -282,7 +360,9 @@ state from its **own** traffic, no OPNsense dependency.
 ### 8.1 Per-path metrics
 - **Loss** — derived from gaps in the received `seq` stream (passive) and from
   keepalive echoes (active).
-- **RTT** — from timestamps echoed in keepalive/control frames.
+- **RTT** — from timestamps echoed in `CONTROL`/`KEEPALIVE` frames, which are
+  sent **directly on the path and bypass FEC** (§5), so the sample is a clean
+  round-trip time, not one gated behind block decoding.
 - **Jitter** — EWMA of inter-arrival time variance (games die on jitter before
   loss).
 
@@ -328,14 +408,24 @@ Why inner connections survive a WAN cutover:
    a VPS, so all *inner* connections already present a fixed IP to the
    internet. Only the office↔VPS tunnel segment is at risk.
 2. **Session keyed by `session_id`, not source IP.** The server keeps the
-   session across endpoint changes.
+   session across endpoint changes and tracks a **per-path endpoint** per WAN
+   (§9 below), so it can answer each uplink on the same path it arrived on.
 3. **Fast data-plane switch.** Standby warm path / graceful drain keeps the
-   switch inside session timeouts (TCP: seconds; games: tens of seconds).
-4. **Reorder + jitter buffers** smooth the transition so the inner layer sees
-   in-order, low-jitter delivery instead of a burst.
+   switch inside session timeouts (TCP: seconds; games: tens of seconds),
+   well under the < 300 ms failover budget (§3.2).
+4. **The delivery buffer** (reorder + jitter in one window) smooths the
+   transition so the inner layer sees in-order, low-jitter delivery instead of
+   a burst.
 5. **TCP self-heals the residual gap.** Any frames lost at the exact cutover
    instant are recovered by TCP retransmission; games tolerate a sub-second
    blip via prediction.
+
+### 9.1 Per-path endpoints (session model)
+In `lb` mode the server may simultaneously receive a session's frames from
+several source addresses (one per WAN). The session tracks `map[pathID]net.Addr`
+and routes each reply back over the same path it came from. In `standby` mode
+only one entry is active at a time; switching just changes which entry is used
+— no re-handshake, no session reset.
 
 ---
 
@@ -359,10 +449,20 @@ so new wire formats are drop-in.
 - **Cipher:** ChaCha20-Poly1305 (AEAD, constant-time, fast on CPUs without
   AES-NI, matches WireGuard's own primitives). AES-256-GCM available.
   *(Upgrade over udp2raw's AES-CBC + HMAC-SHA1.)*
-- **Authentication / integrity:** AEAD tag over header+payload; replay window
-  (anti-replay) to reject replayed frames.
-- **Key:** shared secret from config (`crypto.key`); server may also issue
-  ephemeral keys at connect.
+- **Keying: always a shared pre-shared key (PSK) from config (`crypto.key`).**
+  AEAD keys are derived from it. There is **no unauthenticated "ephemeral key
+  from the server" path** — without a shared secret nothing stops a MITM from
+  impersonating either side. (A proper X25519 + signature key-exchange for
+  forward secrecy is a future roadmap item, not v1.)
+- **Authentication / integrity:** the AEAD tag over header+payload
+  authenticates the `session_id`, so a forged or hijacked session cannot inject
+  frames without the key. The anti-replay sliding window rejects replayed
+  `seq`s and is sized **≥ the delivery-buffer window** (§5) so it never drops
+  legitimate frames that multi-path delivery reordered.
+- **`crypto.integrity_only` (optional):** because WireGuard already encrypts the
+  inner data, this mode authenticates the plaintext with a Poly1305 MAC instead
+  of full AEAD — same integrity, less CPU on high-throughput links.
+  Default: full AEAD.
 - **Note:** inner traffic is additionally encrypted by WireGuard, but the
   tunnel layer must still authenticate/integrity-protect to stop an attacker
   from injecting frames into the tunnel.
@@ -387,12 +487,15 @@ so new wire formats are drop-in.
 
 Full reference in [CONFIG.md](CONFIG.md). Highlights:
 - `wans[].capacity_mbps` — declared bandwidth, drives capacity-weighted balancing.
-- `fec.enabled`, `fec.mode` (`adaptive`/`fixed`/`off`), `fec.max_loss_pct`,
-  `fec.block_timeout_ms` — per-link FEC; can be disabled entirely.
-- `scheduler.mode` (`lb`/`standby`), `scheduler.balance_by`
-  (`capacity`/`fec`/`roundrobin`).
+- `fec.enabled`, `fec.mode` (`adaptive`/`fixed`/`off`/`crosspath`),
+  `fec.max_loss_pct`, `fec.block_timeout_ms` — per-link FEC; can be disabled
+  entirely.
+- `scheduler.mode` (`lb`/`standby`), `scheduler.affinity` (`flow`/`packet`),
+  `scheduler.balance_by` (`capacity`/`fec`/`roundrobin`).
+- `scheduler.queue` — per-WAN queue size, rate limit, drop policy (§7.6).
+- `mtu` — inner MTU advertised to WireGuard (§6.6).
 - `health.*` — EWMA weights, `degrade_sec`, `recover_min`, `probe_interval`.
-- `crypto.cipher`, `crypto.key`.
+- `crypto.cipher`, `crypto.key`, `crypto.integrity_only`.
 
 ---
 
@@ -400,24 +503,34 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
 
 - **M0 — Foundation** *(this repo):* repo, docs, config package + validation,
   build system, CI.
-- **M1 — Data path:** session, sequence, frame framing, crypto (ChaCha20-Poly1305),
-  UDP transport, one-WAN client/server that passes WireGuard traffic.
-- **M2 — FEC:** RS encoder/decoder, adaptive redundancy, per-path config, `off`.
-- **M3 — Scheduler + health:** `lb` (capacity-weighted) and `standby` modes,
-  EWMA monitoring, circuit breaker, graceful drain, reorder/jitter buffers.
-- **M4 — Multi-WAN resilience:** endpoint migration (`session_id`), warm
-  standby failover, cross-path FEC (optional), FakeTCP + ICMP transports.
-- **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging, docs site.
+- **M1 — Data path:** session, sequence, frame framing, crypto (ChaCha20-Poly1305,
+  shared-PSK auth), UDP transport, one-WAN client/server that passes WireGuard
+  traffic.
+- **M2 — FEC:** per-WAN RS encoder/decoder, adaptive redundancy, per-path
+  config, `off`.
+- **M3 — Scheduler + health:** `lb` (flow-affine, capacity-weighted) and
+  `standby` modes, EWMA monitoring, circuit breaker, graceful drain,
+  delivery buffer (reorder+jitter), per-WAN queues/rate-limit.
+- **M4 — Multi-WAN resilience:** per-path endpoints (`session_id`), warm
+  standby failover, `affinity: packet` + cross-path FEC (optional),
+  FakeTCP + ICMP transports.
+- **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging, docs
+  site, authenticated key-exchange (forward secrecy).
 
 ---
 
 ## 15. Testing Strategy
 
-- **Unit:** FEC against scripted loss patterns; reorder buffer; EWMA + state
-  machine transitions; scheduler weighting math; config validation.
+- **Unit:** FEC against scripted loss patterns (per-WAN and cross-path); the
+  delivery (reorder+jitter) buffer; EWMA + state-machine transitions;
+  scheduler weighting and affinity math; config validation. Assert the
+  invariants: replay window ≥ delivery window, per-WAN FEC blocks never split
+  across paths, per-path endpoint routing.
 - **Integration (Linux):** `tc netem` to simulate per-path loss/latency/jitter
   and hard link loss; verify WireGuard traffic flows end-to-end and that a WAN
   cutover preserves an in-flight TCP session (`ss` / `nethogs` / throughput
   tests).
 - **Resilience:** kill a path mid-transfer, assert bounded packet loss and
-  session survival; assert `recover_min` re-add behaviour.
+  session survival; assert `recover_min` re-add behaviour; assert a
+  load-balanced session keeps both WAN endpoints active and answers on the
+  correct path.

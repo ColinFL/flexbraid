@@ -59,9 +59,11 @@ Header size (before payload): **24 bytes**. Tag: 16 bytes.
   the tunnel by this and **ignores source IP/port changes** (the basis of
   seamless failover).
 - **seq** — global, monotonically increasing across **all** WANs. Basis for the
-  reorder buffer and FEC block grouping.
+  server's delivery (reorder) buffer.
 - **block_seq** — identifies the FEC block a frame belongs to. Data and parity
-  frames of the same block share `block_seq`; `seq` orders frames within it.
+  frames of the same block share `block_seq`. Because **FEC blocks are built per
+  WAN** (§4), `block_seq` is scoped to one WAN; frames on different WANs may
+  reuse `block_seq` values.
 
 ---
 
@@ -74,11 +76,17 @@ Header size (before payload): **24 bytes**. Tag: 16 bytes.
    parameters. From then on both sides use that `session_id`.
 
 ### Endpoint migration (failover)
-Because `session_id` — not source IP — identifies the session, a client that
+Because `session_id` — not source IP — identifies a session, a client that
 moves from WAN A to WAN B simply keeps sending frames from the new socket. The
-server updates the stored endpoint for that `session_id` on the first valid
-frame received and routes replies back to the new address. The inner layer
-never observes the change.
+server keys the session by `session_id` and tracks a **per-path endpoint**:
+each WAN's frames arrive from a distinct source address, and the server routes
+replies back on the path they came from (§9.1 of the design).
+
+- **`standby` mode:** one endpoint is active at a time; on failover the first
+  valid frame from the new WAN simply switches which per-path endpoint is used.
+  No re-handshake, no session reset.
+- **`lb` mode:** several endpoints may be active concurrently; the server
+  answers each path independently. The inner layer never observes any of this.
 
 ### Keepalive
 When idle, each side sends a `KEEPALIVE` frame. It carries a timestamp in the
@@ -90,14 +98,22 @@ otherwise adaptive to traffic.
 
 ## 4. FEC blocks
 
-FEC operates on a **block** = a contiguous run of `block_seq`. A block contains
-`k` data frames and `n−k` parity frames (RS(n,k)). Parity frames carry
-`FEC_PARITY` and a copy of the block's data-frame `seq`s in their payload
-header so the decoder can map parity to the right data positions.
+**Blocks are constructed per WAN.** Each WAN's transport encodes *its own*
+outbound frames into self-contained RS(`n`,`k`) blocks (data + parity on the
+same path). This keeps within-path FEC coherent regardless of the scheduler and
+is the enforcement of the FEC ↔ scheduler invariant (design §7.4).
 
-A block is recoverable if at least `k` of its `n` frames arrive. The encoder
-waits up to `fec.block_timeout_ms` to fill `k` data frames, then emits the
-parity. This bounds added latency.
+A block contains `k` data frames and `n−k` parity frames. Parity frames carry
+`FEC_PARITY` and reference the block's data-frame `seq`s so the decoder can map
+parity to the right data positions. A block is recoverable if at least `k` of
+its `n` frames arrive.
+
+The encoder waits up to `fec.block_timeout_ms` to fill `k` data frames, then
+emits the parity. This bounds added latency.
+
+> Cross-path FEC (design §6.4) is a separate, optional mode that spans blocks
+> across **all** WANs; it is only valid with `scheduler.affinity: packet` and is
+> off by default.
 
 ---
 
@@ -110,6 +126,10 @@ parity. This bounds added latency.
 - runtime control (reconfigure, drain, shutdown) — the in-band counterpart to
   the CLI signal/FIFO interface.
 
+**`CONTROL`/`KEEPALIVE` frames bypass FEC** — they are sent directly on the
+path (not erasure-coded), so a keepalive round-trip is a clean RTT sample
+rather than one gated behind block decoding (design §8.1).
+
 Sub-protocol message types are defined in code as `internal/frame` control
 messages; wire numbering is reserved here and documented there.
 
@@ -117,9 +137,17 @@ messages; wire numbering is reserved here and documented there.
 
 ## 6. Security
 
-- **AEAD:** ChaCha20-Poly1305 (default) or AES-256-GCM, key from `crypto.key`
-  (or ephemeral, server-issued at handshake).
-- **Anti-replay:** a sliding-window replay filter rejects replayed `seq`s.
+- **Keying: shared PSK only.** ChaCha20-Poly1305 (default) or AES-256-GCM, key
+  derived from `crypto.key`. There is **no unauthenticated ephemeral-key path**:
+  without a shared secret nothing prevents a MITM from impersonating either
+  side. (Authenticated key-exchange is a roadmap item, not v1.)
+- **Authentication / integrity:** the AEAD tag (or the Poly1305 MAC in
+  `crypto.integrity_only` mode) authenticates header + payload, including
+  `session_id`, so a forged/hijacked session cannot inject frames without the
+  key.
+- **Anti-replay:** a sliding-window replay filter rejects replayed `seq`s. The
+  window is sized **≥ the delivery-buffer window** (design §5) so it never
+  drops legitimate frames that multi-path delivery reordered.
 - The header (excluding the variable payload) is authenticated by the tag, so
   a corrupted/forged header fails decryption.
 

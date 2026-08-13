@@ -8,11 +8,17 @@ listen: 0.0.0.0:51820   # client: where inner traffic (WireGuard) points at.
 server: 203.0.113.1:4096   # (client only) FlexBraid server address:port
 session_id: auto        # "auto" (random) | <hex>; server keys sessions by this,
                         # NOT by source IP — the basis of seamless failover.
+mtu: 1420               # inner MTU advertised to WireGuard (headroom for FEC+headers)
 
 # --- scheduler -----------------------------------------------------------
 scheduler:
   mode: lb              # "lb" (active load balance) | "standby" (warm standby)
+  affinity: flow        # "flow" (per-connection, default) | "packet" (per-frame)
   balance_by: capacity  # lb only: "capacity" | "fec" | "roundrobin"
+  queue:
+    max_pkts: 1024      # bounded per-WAN send queue (BDP-aware)
+    rate_limit_mbps: 0  # 0 = use each WAN's capacity_mbps
+    drop: drop-oldest   # on overflow: "drop-oldest" (TCP) | "drop-newest" (games)
 
 # --- forward error correction (can be fully disabled) --------------------
 fec:
@@ -49,8 +55,9 @@ health:
 
 # --- crypto --------------------------------------------------------------
 crypto:
-  key: ""                     # shared secret; empty = ephemeral (server issues)
+  key: "change-me"            # shared PSK (required); AEAD keys derived from it
   cipher: chacha20poly1305    # "chacha20poly1305" | "aes256gcm"
+  integrity_only: false       # true = Poly1305 MAC only (WG already encrypts inner data)
 
 # --- logging -------------------------------------------------------------
 log:

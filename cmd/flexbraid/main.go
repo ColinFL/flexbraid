@@ -44,8 +44,8 @@ func main() {
 
 func run(cfg *config.Config) error {
 	logger := log.New(os.Stderr, "[flexbraid] ", log.LstdFlags)
-	logger.Printf("loaded config: mode=%s listen=%s session=%s scheduler=%s balance_by=%s",
-		cfg.Mode, cfg.Listen, cfg.SessionID, cfg.Scheduler.Mode, cfg.Scheduler.BalanceBy)
+	logger.Printf("loaded config: mode=%s listen=%s session=%s mtu=%d scheduler=%s affinity=%s balance_by=%s",
+		cfg.Mode, cfg.Listen, cfg.SessionID, cfg.MTU, cfg.Scheduler.Mode, cfg.Scheduler.Affinity, cfg.Scheduler.BalanceBy)
 	logger.Printf("fec: enabled=%v mode=%s max_loss_pct=%.0f",
 		cfg.FEC.Enabled, cfg.FEC.Mode, cfg.FEC.MaxLossPct)
 	for _, w := range cfg.WANs {

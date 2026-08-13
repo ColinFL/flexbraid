@@ -17,6 +17,7 @@ listen: 0.0.0.0:51820 # client: where inner traffic (WireGuard) points at.
 server: 203.0.113.1:4096   # (client only) server address:port
 session_id: auto      # "auto" (random) | <hex>. Server keys sessions by this,
                       # NOT by source IP — this is what makes failover seamless.
+mtu: 1420             # inner MTU advertised to WireGuard (default 1420)
 scheduler: {...}
 fec: {...}
 wans: [ ... ]
@@ -32,16 +33,28 @@ log: {...}
 ```yaml
 scheduler:
   mode: lb            # "lb" (active load balance, default) | "standby" (warm standby)
+  affinity: flow      # "flow" (per-connection, default) | "packet" (per-frame)
   balance_by: capacity  # lb only: "capacity" | "fec" | "roundrobin"
+  queue:
+    max_pkts: 1024      # bounded per-WAN send queue depth (BDP-aware)
+    rate_limit_mbps: 0  # 0 = use each WAN's capacity_mbps
+    drop: drop-oldest   # on overflow: "drop-oldest" (TCP) | "drop-newest" (games)
 ```
 
 - `mode: lb` — spread frames across all healthy WANs.
 - `mode: standby` — one WAN hot, the rest warm standbys (near-zero-loss
   failover, no load splitting).
+- `affinity`:
+  - `flow` *(default)* — each inner flow sticks to one WAN; no intra-connection
+    reordering; per-WAN FEC is coherent.
+  - `packet` — distribute packet-by-packet (aggregate throughput; needs the
+    delivery buffer; required for `fec.mode: crosspath`).
 - `balance_by`:
   - `capacity` *(default)* — weight each WAN by its declared `capacity_mbps`.
   - `fec` — like `capacity` but subtract per-path adaptive FEC overhead first.
   - `roundrobin` — ignore weights, rotate evenly.
+- `queue` — per-WAN send queue discipline (§7.6 of the design): bounded depth,
+  optional explicit rate limit, and overflow drop policy.
 
 ---
 
@@ -50,7 +63,7 @@ scheduler:
 ```yaml
 fec:
   enabled: true        # false disables erasure coding entirely
-  mode: adaptive       # "adaptive" | "fixed" | "off"
+  mode: adaptive       # "adaptive" | "fixed" | "off" | "crosspath"
   max_loss_pct: 20     # compensable random-loss % per path (0–90)
   block_timeout_ms: 8  # block collection window; larger n = more latency
   fixed_overhead_pct: 25  # used only when mode: fixed
@@ -61,6 +74,12 @@ fec:
 - `adaptive` *(recommended)* — redundancy follows measured loss; a clean WAN
   carries near-zero overhead.
 - `fixed` — constant `fixed_overhead_pct` redundancy.
+- `crosspath` — code erasure blocks across all WANs to survive a whole-WAN
+  loss (costs capacity). **Requires `scheduler.affinity: packet`.**
+
+> FEC repairs **random loss within a working path**; it cannot survive a full
+> WAN cutover by itself unless `mode: crosspath` is used (see
+> [DESIGN.md §6](DESIGN.md#6-forward-error-correction-adaptive-optional)).
 
 Compensable-loss math:
 
@@ -124,8 +143,9 @@ takes a while to declare a path healthy again. This is the
 
 ```yaml
 crypto:
-  key: ""                     # shared secret; empty = ephemeral (server issues)
+  key: "change-me"            # shared PSK (REQUIRED); AEAD keys derived from it
   cipher: chacha20poly1305    # "chacha20poly1305" | "aes256gcm"
+  integrity_only: false       # true = Poly1305 MAC only (WG already encrypts inner data)
 ```
 
 ---

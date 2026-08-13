@@ -34,6 +34,7 @@ health:
   degrade_sec: 3
   recover_min: 2
 crypto:
+  key: test-secret
   cipher: chacha20poly1305
 log:
   level: info
@@ -98,6 +99,44 @@ func TestValidateRejectsNoWANs(t *testing.T) {
 	cfg := strings.Replace(sample, "wans:\n  - id: w1\n    transport: faketcp\n    iface: igc1\n    capacity_mbps: 300\n  - id: w2\n    transport: udp\n    iface: igc0\n    capacity_mbps: 100\n", "wans: []\n", 1)
 	if _, err := loadString(cfg); err == nil {
 		t.Error("expected error for empty WAN list")
+	}
+}
+
+func TestAffinityDefaultsToFlow(t *testing.T) {
+	c, err := loadString(sample)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if c.Scheduler.Affinity != AffinityFlow {
+		t.Errorf("affinity = %q, want flow", c.Scheduler.Affinity)
+	}
+	if c.MTU != 1420 {
+		t.Errorf("mtu = %d, want 1420", c.MTU)
+	}
+}
+
+func TestCrosspathRequiresPacketAffinity(t *testing.T) {
+	// default affinity is flow -> crosspath must be rejected
+	cfg := strings.Replace(sample, "mode: adaptive", "mode: crosspath", 1)
+	if _, err := loadString(cfg); err == nil {
+		t.Error("expected error: crosspath FEC with flow affinity")
+	}
+	// with packet affinity it must be accepted
+	cfg = strings.Replace(sample, "mode: lb\n  balance_by: capacity", "mode: lb\n  affinity: packet\n  balance_by: capacity", 1)
+	cfg = strings.Replace(cfg, "mode: adaptive", "mode: crosspath", 1)
+	c, err := loadString(cfg)
+	if err != nil {
+		t.Fatalf("crosspath with packet affinity should be valid: %v", err)
+	}
+	if c.FEC.Mode != FECCrosspath || c.Scheduler.Affinity != AffinityPacket {
+		t.Errorf("unexpected config: fec=%s affinity=%s", c.FEC.Mode, c.Scheduler.Affinity)
+	}
+}
+
+func TestKeyRequired(t *testing.T) {
+	cfg := strings.Replace(sample, "key: test-secret", "key: \"\"", 1)
+	if _, err := loadString(cfg); err == nil {
+		t.Error("expected error: crypto.key is required")
 	}
 }
 

@@ -89,10 +89,11 @@ State transitions follow the circuit breaker in [DESIGN.md §8](DESIGN.md#8-heal
 
 1. Any socket delivers an authenticated frame → `session.Manager` looks it up
    by `session_id`.
-2. `fec.Decoder` reassembles blocks (tolerating up to `n−k` losses).
-3. `reorder buffer` restores global `seq` order across interleaved paths.
-4. `jitter buffer` smooths latency; `tunnel.Egress` writes the ordered inner
-   datagram to the WireGuard-side UDP socket.
+2. `fec.Decoder` reassembles per-WAN blocks (tolerating up to `n−k` losses).
+3. The **delivery buffer** (reorder + jitter in one window) restores global
+   `seq` order across interleaved paths and smooths latency.
+4. `tunnel.Egress` writes the ordered inner datagram to the WireGuard-side UDP
+   socket.
 
 ---
 
