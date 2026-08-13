@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/FreeBSD-OPNsense-blue.svg)](#)
 [![Platforms](https://img.shields.io/badge/Linux-Debian-orange.svg)](#)
-![Status](https://img.shields.io/badge/Status-WIP-yellow.svg)
+![Status](https://img.shields.io/badge/Status-M1%20data%20path-blue.svg)
 
 *Many WANs. One connection. No dropped sessions.*
 
@@ -113,8 +113,10 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 
 ## Roadmap
 
-- **M0 — Foundation** *(current)*: repo, docs, config package + validation, CI.
-- **M1 — Data path:** session, framing, crypto, UDP transport, one-WAN tunnel.
+- **M0 — Foundation** *(done)*: repo, docs, config package + validation.
+- **M1 — Data path** *(done)*: session, framing, crypto (ChaCha20-Poly1305,
+  shared-PSK), anti-replay, UDP transport, one-WAN client/server tunnel —
+  integration-tested end-to-end.
 - **M2 — FEC:** RS encode/decode, adaptive redundancy.
 - **M3 — Scheduler + health:** `lb`/`standby`, EWMA monitor, circuit breaker.
 - **M4 — Resilience:** endpoint migration, warm failover, FakeTCP/ICMP.

@@ -1,7 +1,9 @@
 # FlexBraid — Wire Protocol
 
-> ⚠️ **WIP.** Draft spec for the on-the-wire format. The data path is not
-> implemented yet; this document is the contract to build against.
+> **Status:** M1 implemented. The single-WAN data path (session, framing,
+> crypto, UDP transport) is working and tested; multi-WAN scheduling (M3) and
+> FEC (M2) are still being built. This document is the contract to build
+> against — changes must be reflected here.
 
 ---
 
@@ -45,7 +47,7 @@ Poly1305 tag over the header+payload.
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-Header size (before payload): **24 bytes**. Tag: 16 bytes.
+Header size (before payload): **28 bytes**. Tag: 16 bytes.
 
 ### Field notes
 - **magic** — `0x46 0x4C 0x58 0x42` (`FLXB`). Used to detect garbage/wrong key.

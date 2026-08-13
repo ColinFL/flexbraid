@@ -108,6 +108,7 @@ type Config struct {
 	Mode      Mode   `yaml:"mode"`
 	Listen    string `yaml:"listen"`
 	Server    string `yaml:"server"`
+	WGPeer    string `yaml:"wg_peer"`    // server mode: inner WireGuard peer (egress)
 	SessionID string `yaml:"session_id"` // auto | <hex> (server keys sessions by this, not source IP)
 	Scheduler Sched  `yaml:"scheduler"`
 	FEC       FEC    `yaml:"fec"`
@@ -197,7 +198,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("listen address is required")
 	}
 	if c.Mode == ModeClient && c.Server == "" {
-		return fmt.Errorf("server address is required in client mode")
+		return fmt.Errorf("client requires server address")
+	}
+	if c.Mode == ModeServer && c.WGPeer == "" {
+		return fmt.Errorf("server requires wg_peer (inner WireGuard peer address)")
 	}
 	if c.SessionID == "" {
 		c.SessionID = "auto"
@@ -266,7 +270,10 @@ func (c *Config) Validate() error {
 	}
 
 	if len(c.WANs) == 0 {
-		return fmt.Errorf("at least one WAN is required")
+		if c.Mode == ModeClient {
+			return fmt.Errorf("client requires at least one WAN")
+		}
+		// server mode: M1 binds its own WAN transport internally
 	}
 	seen := map[string]bool{}
 	for i := range c.WANs {

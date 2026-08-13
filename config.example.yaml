@@ -6,6 +6,7 @@ mode: client            # "client" | "server"
 listen: 0.0.0.0:51820   # client: where inner traffic (WireGuard) points at.
                         # server: where FlexBraid clients connect.
 server: 203.0.113.1:4096   # (client only) FlexBraid server address:port
+wg_peer: 127.0.0.1:51821   # (server only) inner WireGuard peer (egress target)
 session_id: auto        # "auto" (random) | <hex>; server keys sessions by this,
                         # NOT by source IP — the basis of seamless failover.
 mtu: 1420               # inner MTU advertised to WireGuard (headroom for FEC+headers)
@@ -31,7 +32,7 @@ fec:
 # --- WANs: one entry per physical uplink (any number) --------------------
 wans:
   - id: w1
-    transport: faketcp  # "udp" | "faketcp" | "icmp"
+    transport: udp     # "udp" (M1) | "faketcp" | "icmp" (M4)
     iface: igc1         # bind device (optional)
     capacity_mbps: 300  # declared bandwidth → drives capacity-weighted balancing
     weight: 1.0
