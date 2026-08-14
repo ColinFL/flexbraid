@@ -1,8 +1,9 @@
 // Command flexbraid runs the FlexBraid multi-WAN bonding tunnel.
 //
 // FlexBraid weaves several WANs into one logical link so that an inner VPN
-// such as WireGuard sees a single stable connection. This milestone (M1)
-// implements the single-WAN data path; multi-WAN scheduling and FEC follow.
+// such as WireGuard sees a single stable connection. This milestone (M2)
+// implements the single-WAN data path with end-to-end FEC; the M3 scheduler
+// adds multi-WAN load balancing and the health monitor.
 //
 // Usage:
 //
@@ -23,7 +24,7 @@ import (
 	"github.com/ColinFL/flexbraid/internal/tunnel"
 )
 
-var version = "0.1.0-m1"
+var version = "0.1.0-m2"
 
 func main() {
 	cfgPath := flag.String("c", "config.yaml", "path to YAML config file")

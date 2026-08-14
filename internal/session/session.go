@@ -100,6 +100,14 @@ type ServerSession struct {
 	seq    atomic.Uint32
 	replay crypto.ReplayWindow // client → server frames
 
+	// egress is the session's dedicated UDP socket to the WG peer (P1:
+	// per-session egress). Replies from the WG peer return on this socket,
+	// so they are naturally attributed to the right session — the old
+	// shared socket could not demultiplex multiple clients. Set once at
+	// session creation before the egress reader goroutine starts, then
+	// read-only; closed by the sweeper or server shutdown.
+	egress *net.UDPConn
+
 	mu        sync.Mutex
 	endpoints map[string]*net.UDPAddr // per-path endpoint (WAN ID → address)
 
@@ -135,6 +143,21 @@ func (s *ServerSession) IdleSince() time.Time {
 
 // AEAD returns the per-session cipher (read-only after construction).
 func (s *ServerSession) AEAD() cipher.AEAD { return s.aead }
+
+// SetEgress attaches the session's dedicated egress socket to the WG peer.
+// Must be called once, before the egress reader goroutine starts.
+func (s *ServerSession) SetEgress(c *net.UDPConn) { s.egress = c }
+
+// Egress returns the session's egress socket (nil until SetEgress).
+func (s *ServerSession) Egress() *net.UDPConn { return s.egress }
+
+// CloseEgress closes the session's egress socket, unblocking its reader.
+// Safe to call multiple times.
+func (s *ServerSession) CloseEgress() {
+	if s.egress != nil {
+		s.egress.Close()
+	}
+}
 
 // SetEndpoint records (or updates) the return address for a path (WAN).
 func (s *ServerSession) SetEndpoint(pathID string, addr *net.UDPAddr) {
@@ -206,20 +229,37 @@ func (m *Manager) All() []*ServerSession {
 	return out
 }
 
-// Expire removes sessions whose last authenticated frame is older than ttl.
+// Expire removes sessions whose last authenticated frame is older than ttl
+// and closes their egress sockets (which also stops their egress readers).
 // Returns the number of sessions removed.
 func (m *Manager) Expire(ttl time.Duration) int {
 	cutoff := time.Now().Add(-ttl)
-	var victims []ID
+	var victims []*ServerSession
 	m.mu.Lock()
 	for id, s := range m.sessions {
 		if s.IdleSince().Before(cutoff) {
-			victims = append(victims, id)
+			victims = append(victims, s)
+			delete(m.sessions, id)
 		}
 	}
-	for _, id := range victims {
+	m.mu.Unlock()
+	for _, s := range victims {
+		s.CloseEgress()
+	}
+	return len(victims)
+}
+
+// CloseAll closes every session's egress socket and clears the table.
+// Used at server shutdown to unblock all egress readers.
+func (m *Manager) CloseAll() {
+	m.mu.Lock()
+	sessions := make([]*ServerSession, 0, len(m.sessions))
+	for id, s := range m.sessions {
+		sessions = append(sessions, s)
 		delete(m.sessions, id)
 	}
 	m.mu.Unlock()
-	return len(victims)
+	for _, s := range sessions {
+		s.CloseEgress()
+	}
 }

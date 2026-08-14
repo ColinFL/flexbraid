@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ColinFL/flexbraid/internal/config"
@@ -27,7 +29,9 @@ const (
 
 // Server is the FlexBraid tunnel server (VPS side). It accepts sessions from
 // clients over the WAN transport and forwards inner datagrams to the
-// WireGuard peer over a connected egress socket.
+// WireGuard peer. Each session owns a dedicated egress socket (P1), so WG
+// replies return on the socket of the session they belong to — the shared
+// single-socket design could not demultiplex multiple clients.
 type Server struct {
 	cfg       *config.Config
 	log       *slog.Logger
@@ -37,7 +41,18 @@ type Server struct {
 	wanTr     transport.Transport
 	fecParams fec.Params
 	fecDec    *fec.Decoder // client → server (all sessions)
-	egress    *net.UDPConn // read-only after Start
+
+	// egressAddr is the resolved WG peer address (read-only after Start).
+	egressAddr *net.UDPAddr
+
+	// sendMu serializes batches of frames on the shared WAN transport so
+	// concurrent senders (egress readers, FEC tick, handshake ACK) cannot
+	// interleave frames and reorder them on the wire (P4).
+	sendMu sync.Mutex
+	// egressWG tracks per-session egress readers for clean shutdown.
+	egressWG sync.WaitGroup
+	// sendErrs throttles repeated send-failure logging (P6).
+	sendErrs atomic.Uint64
 }
 
 // NewServer builds a tunnel server from config.
@@ -84,8 +99,10 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	}, nil
 }
 
-// Start binds the WAN listen socket and dials the egress (WG peer). It must
-// be called before Run and returns init errors synchronously.
+// Start binds the WAN listen socket and resolves the egress (WG peer)
+// address. It must be called before Run and returns init errors
+// synchronously. Per-session egress sockets are dialed lazily at session
+// creation (see handleClientFrame).
 func (s *Server) Start() error {
 	if err := s.wanTr.Open(); err != nil {
 		return fmt.Errorf("wan listen: %w", err)
@@ -95,12 +112,7 @@ func (s *Server) Start() error {
 		s.wanTr.Close()
 		return fmt.Errorf("wg_peer address: %w", err)
 	}
-	egress, err := net.DialUDP("udp", nil, egressAddr)
-	if err != nil {
-		s.wanTr.Close()
-		return fmt.Errorf("egress dial %s: %w", s.cfg.WGPeer, err)
-	}
-	s.egress = egress
+	s.egressAddr = egressAddr
 	return nil
 }
 
@@ -108,7 +120,12 @@ func (s *Server) Start() error {
 // first.
 func (s *Server) Run(ctx context.Context) error {
 	defer s.wanTr.Close()
-	defer s.egress.Close()
+	defer func() {
+		// Close every session's egress socket first (unblocks the egress
+		// readers), then wait for them to exit.
+		s.mgr.CloseAll()
+		s.egressWG.Wait()
+	}()
 
 	s.log.Info("server started",
 		"listen", s.cfg.Listen,
@@ -124,18 +141,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// FEC block assembly timeouts (short blocks on both directions).
 	go s.fecTickLoop(ctx)
 
-	// Inner replies (WG → client) arrive on the egress socket; fan them out
-	// to every known session endpoint.
-	egressDone := make(chan struct{})
-	go func() {
-		defer close(egressDone)
-		s.egressLoop()
-	}()
-
 	err := s.wanLoop(ctx)
-	s.wanTr.Close()
-	s.egress.Close()
-	<-egressDone
 	<-sweepDone
 	return err
 }
@@ -204,9 +210,19 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 					"session", fmt.Sprintf("%016x", uint64(id)))
 				return
 			}
+			// Dial the session's dedicated egress socket to the WG peer.
+			// Replies from the WG peer will return on this socket, which is
+			// how the server attributes them to the right session (P1).
+			egress, err := net.DialUDP("udp", nil, s.egressAddr)
+			if err != nil {
+				s.log.Warn("egress dial failed, dropping handshake",
+					"session", fmt.Sprintf("%016x", uint64(id)), "error", err)
+				return
+			}
 			sessKey := crypto.DeriveSessionKey(s.psk, uint64(id))
 			sessAEAD, err := crypto.NewAEAD(sessKey, s.cfg.Crypto.Cipher)
 			if err != nil {
+				egress.Close()
 				return
 			}
 			sess = session.NewServerSession(id, sessAEAD)
@@ -214,10 +230,14 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 			// because parity frames are sealed with the session's key.
 			enc, err := fec.NewEncoder(s.fecParams)
 			if err != nil {
+				egress.Close()
 				return
 			}
 			sess.Enc = enc
+			sess.SetEgress(egress)
 			s.mgr.Put(sess)
+			s.egressWG.Add(1)
+			go s.egressReader(sess)
 		}
 		if !sess.CheckReplay(hdr.Seq) {
 			return // replayed handshake
@@ -252,20 +272,29 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 	if len(f.Payload) == 0 {
 		return
 	}
-	s.forwardToEgress(s.fecDec.Push(f))
+	s.forwardDecoded(s.fecDec.Push(f))
 }
 
-// forwardToEgress writes decoded inner datagrams to the WG peer.
-func (s *Server) forwardToEgress(frames []*frame.Frame) {
+// forwardDecoded writes decoded inner datagrams to the egress socket of the
+// session each frame belongs to (P1): the WG peer's replies return on the
+// same socket, which is what routes them back to the right session. Used
+// both for direct delivery (handleClientFrame) and for frames assembled by
+// the shared decoder (fecTickLoop), where sessions can be mixed.
+func (s *Server) forwardDecoded(frames []*frame.Frame) {
 	for _, f := range frames {
-		if _, err := s.egress.Write(f.Payload); err != nil {
+		sess := s.mgr.Get(session.ID(f.SessionID))
+		if sess == nil {
+			continue // session expired between decode and delivery
+		}
+		if _, err := sess.Egress().Write(f.Payload); err != nil {
 			s.log.Warn("egress write failed", "error", err)
 		}
 	}
 }
 
 // sendAck answers a FIRST frame with a CONTROL ACK on the same path, sealed
-// with the session key.
+// with the session key. Holds sendMu so the ACK cannot interleave with
+// data batches on the WAN (P4).
 func (s *Server) sendAck(sess *session.ServerSession, addr *net.UDPAddr) {
 	f := &frame.Frame{
 		Flags:     frame.FlagControl,
@@ -280,41 +309,60 @@ func (s *Server) sendAck(sess *session.ServerSession, addr *net.UDPAddr) {
 	if err != nil {
 		return
 	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	if err := s.wanTr.SendTo(addr, sealed); err != nil {
-		s.log.Warn("ack send failed", "error", err)
+		s.noteSendErr(err)
 	}
 }
 
-// egressLoop relays inner replies (from the WG peer) back to every client
-// session endpoint.
-func (s *Server) egressLoop() {
+// egressReader relays inner replies (from the WG peer) of one session back
+// to that session's client endpoints. One goroutine per session; it exits
+// when the session's egress socket is closed (expiry or server shutdown).
+// Because the socket is per-session, replies are naturally attributed to
+// the right client (P1).
+func (s *Server) egressReader(sess *session.ServerSession) {
+	defer s.egressWG.Done()
 	buf := make([]byte, recvBufSize)
 	for {
-		n, _, err := s.egress.ReadFromUDP(buf)
+		n, _, err := sess.Egress().ReadFromUDP(buf)
 		if err != nil {
 			return // egress closed
 		}
+		if n > s.cfg.MTU {
+			s.noteOversize(sess, n)
+			continue
+		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
-		for _, sess := range s.mgr.All() {
-			f := &frame.Frame{
-				SessionID: uint64(sess.ID),
-				Seq:       sess.NextSeq(), // before Push: sub-header records true seqs
-				Payload:   payload,
-			}
-			if sess.Enc != nil {
-				s.sendToSession(sess, sess.Enc.Push(f))
-			} else {
-				s.sendToSession(sess, []*frame.Frame{f})
-			}
+		f := &frame.Frame{
+			SessionID: uint64(sess.ID),
+			Seq:       sess.NextSeq(), // before Push: sub-header records true seqs
+			Payload:   payload,
+		}
+		if sess.Enc != nil {
+			s.sendToSession(sess, sess.Enc.Push(f))
+		} else {
+			s.sendToSession(sess, []*frame.Frame{f})
 		}
 	}
+}
+
+// noteOversize logs dropped inner datagrams that exceed the configured MTU.
+func (s *Server) noteOversize(sess *session.ServerSession, n int) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	s.log.Warn("dropped oversize inner datagram (mtu exceeded)",
+		"session", fmt.Sprintf("%016x", uint64(sess.ID)), "bytes", n, "mtu", s.cfg.MTU)
 }
 
 // sendToSession seals frames with the session's key and delivers them to
 // every endpoint of the session. Data frames already carry their seq;
-// parity frames get a fresh seq here.
+// parity frames get a fresh seq here. The batch holds sendMu so concurrent
+// senders cannot interleave frames on the WAN (P4).
 func (s *Server) sendToSession(sess *session.ServerSession, frames []*frame.Frame) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	for _, f := range frames {
 		if f.HasFlag(frame.FlagFECParity) {
 			f.Seq = sess.NextSeq()
@@ -327,11 +375,19 @@ func (s *Server) sendToSession(sess *session.ServerSession, frames []*frame.Fram
 		if err != nil {
 			continue
 		}
-		for pathID, ep := range sess.Endpoints() {
+		for _, ep := range sess.Endpoints() {
 			if err := s.wanTr.SendTo(ep, sealed); err != nil {
-				s.log.Warn("reply send failed", "path", pathID, "error", err)
+				s.noteSendErr(err)
 			}
 		}
+	}
+}
+
+// noteSendErr logs send failures at most every 100th occurrence (P6).
+func (s *Server) noteSendErr(err error) {
+	n := s.sendErrs.Add(1)
+	if n == 1 || n%100 == 0 {
+		s.log.Warn("reply send failed", "count", n, "error", err)
 	}
 }
 
@@ -354,7 +410,7 @@ func (s *Server) fecTickLoop(ctx context.Context) {
 					s.sendToSession(sess, sess.Enc.Tick(now))
 				}
 			}
-			s.forwardToEgress(s.fecDec.Tick(now))
+			s.forwardDecoded(s.fecDec.Tick(now))
 		}
 	}
 }

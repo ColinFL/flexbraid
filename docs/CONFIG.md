@@ -3,8 +3,9 @@
 FlexBraid is configured with a single YAML file, passed with `-c path.yaml`.
 Every setting has a sane default; you only need to write what differs.
 
-> ⚠️ **WIP:** config parsing/validation are implemented. The data-path settings
-> below take effect as milestones land (see [Roadmap](DESIGN.md#14-roadmap)).
+> **Status:** M2 (data path + FEC) implemented. Config parsing and validation
+> are live; `scheduler`, `health` and `queue` settings take effect as M3 lands
+> (see [Roadmap](DESIGN.md#14-roadmap)).
 
 ---
 
@@ -18,7 +19,9 @@ server: 203.0.113.1:4096   # (client only) server address:port
 wg_peer: 127.0.0.1:51821   # (server only) inner WireGuard peer (egress target)
 session_id: auto      # "auto" (random) | <hex>. Server keys sessions by this,
                       # NOT by source IP — this is what makes failover seamless.
-mtu: 1420             # inner MTU advertised to WireGuard (default 1420)
+mtu: 1390             # inner MTU. With FEC on: 1500 − 44 (frame+AEAD) − 66
+                      # (parity sub-header, k=10) = 1390; 1420 only with FEC
+                      # off. Validated at startup (P2).
 scheduler: {...}
 fec: {...}
 wans: [ ... ]
@@ -72,8 +75,9 @@ fec:
 
 - `enabled: false` or `mode: off` — no parity frames; the link's raw loss is
   accepted (useful on clean lines / latency-critical low-bandwidth use).
-- `adaptive` *(recommended)* — redundancy follows measured loss; a clean WAN
-  carries near-zero overhead.
+- `adaptive` *(default)* — redundancy computed once from `max_loss_pct`
+  (M2). Live adaptation from measured loss is **TODO(M3)** with the health
+  monitor.
 - `fixed` — constant `fixed_overhead_pct` redundancy.
 - `crosspath` — code erasure blocks across all WANs to survive a whole-WAN
   loss (costs capacity). **Requires `scheduler.affinity: packet`.**
@@ -168,5 +172,6 @@ milestone:
 
 - `session_id` — the client currently always generates a random session ID;
   pinning a fixed ID is for M4+ (multi-client / stable NAT identity).
-- `mtu` — the inner MTU is not yet advertised to WireGuard (the admin sets
-  the WG interface MTU manually in M1/M2); honoured in M6.
+- `mtu` — used since M2 for startup validation (parity-frame headroom) and
+  defense-in-depth drops of oversized inner datagrams. The admin still sets
+  the WireGuard interface MTU manually to the same value.

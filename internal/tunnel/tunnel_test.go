@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/ColinFL/flexbraid/internal/config"
+	"github.com/ColinFL/flexbraid/internal/fec"
+	"github.com/ColinFL/flexbraid/internal/frame"
 	"github.com/ColinFL/flexbraid/internal/transport"
 )
 
@@ -107,6 +109,12 @@ func startTestPairWrapped(t *testing.T, psk string, fecCfg *config.FEC, wrap fun
 		FEC:    fecOpt,
 		Crypto: config.Crypto{Key: psk, Cipher: "chacha20poly1305"},
 	}
+	// With FEC on, the largest parity frame must fit the 1500-byte path MTU
+	// (P2): inner MTU 1390 = 1500 − 28 (frame hdr) − 16 (AEAD) − 66 (parity
+	// sub-header, k=10). Config validation rejects anything larger.
+	if fecOpt.Enabled {
+		srvCfg.MTU = 1390
+	}
 	srv, err = NewServer(srvCfg, log)
 	if err != nil {
 		t.Fatalf("new server: %v", err)
@@ -127,6 +135,9 @@ func startTestPairWrapped(t *testing.T, psk string, fecCfg *config.FEC, wrap fun
 		WANs: []config.WAN{{
 			ID: "w1", Transport: config.TransportUDP, CapacityMbps: 100,
 		}},
+	}
+	if fecOpt.Enabled {
+		cliCfg.MTU = 1390
 	}
 	cli, err = NewClient(cliCfg, log)
 	if err != nil {
@@ -349,5 +360,107 @@ func TestClientStartFailsOnBusyPort(t *testing.T) {
 	}
 	if err := cli.Start(); err == nil {
 		t.Fatal("Start must fail when the ingress port is busy")
+	}
+}
+
+// TestTwoClientsIsolated verifies per-session egress (P1): with two clients
+// on one server, each session must have its own egress socket to the WG
+// peer (observable as distinct source addresses at the peer), and replies
+// must be routed back only to the session that owns them.
+func TestTwoClientsIsolated(t *testing.T) {
+	srv, cli1, fakeWG, wgClient1 := startTestPair(t, "multi-client-psk")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	// Second client on the same server, its own inner WG socket.
+	cli2Cfg := &config.Config{
+		Mode:   config.ModeClient,
+		Listen: "127.0.0.1:0",
+		Server: srv.LocalAddr().String(),
+		Crypto: config.Crypto{Key: "multi-client-psk", Cipher: "chacha20poly1305"},
+		WANs: []config.WAN{{
+			ID: "w1", Transport: config.TransportUDP, CapacityMbps: 100,
+		}},
+	}
+	cli2, err := NewClient(cli2Cfg, testLogger())
+	if err != nil {
+		t.Fatalf("new client 2: %v", err)
+	}
+	if err := cli2.Start(); err != nil {
+		t.Fatalf("client 2 start: %v", err)
+	}
+	go func() { _ = cli2.Run(ctx) }()
+	wgClient2, err := net.ListenUDP("udp", mustUDPAddr(t, "127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("wg client 2 listen: %v", err)
+	}
+	t.Cleanup(func() { wgClient2.Close() })
+
+	// Each client's ping must reach the WG peer from a DISTINCT egress
+	// socket. The P1 regression: the old shared-socket design shows one
+	// source for both.
+	src1 := sendUntilReceived(t, wgClient1, cli1.LocalAddr(), fakeWG, []byte("ping-1"), 6*time.Second)
+	src2 := sendUntilReceived(t, wgClient2, cli2.LocalAddr(), fakeWG, []byte("ping-2"), 6*time.Second)
+	if src1.String() == src2.String() {
+		t.Fatalf("both sessions share one egress socket (%s) — per-session egress broken", src1)
+	}
+
+	// Replies must be routed back per session: "reply-A" only to client 1,
+	// "reply-B" only to client 2.
+	if _, err := fakeWG.WriteToUDP([]byte("reply-A"), src1); err != nil {
+		t.Fatalf("reply A: %v", err)
+	}
+	if _, err := fakeWG.WriteToUDP([]byte("reply-B"), src2); err != nil {
+		t.Fatalf("reply B: %v", err)
+	}
+	expectUDP(t, wgClient1, "reply-A", 3*time.Second)
+	expectUDP(t, wgClient2, "reply-B", 3*time.Second)
+
+	// No cross-talk: client 1 must never see client 2's reply.
+	_ = wgClient1.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	buf := make([]byte, 65535)
+	if n, _, err := wgClient1.ReadFromUDP(buf); err == nil && string(buf[:n]) == "reply-B" {
+		t.Fatalf("client 1 received client 2's reply — session isolation broken")
+	}
+}
+
+// TestMTUValidationRejectsOversizedInnerMTU proves the P2 guard: with FEC
+// on, an inner MTU whose largest parity frame would exceed the 1500-byte
+// path MTU is rejected at construction with the exact bound.
+func TestMTUValidationRejectsOversizedInnerMTU(t *testing.T) {
+	fecOn := &config.FEC{Enabled: true, Mode: config.FECAdaptive, MaxLossPct: 20}
+	base := func(mtu int) *config.Config {
+		return &config.Config{
+			Mode:   config.ModeClient,
+			Listen: "127.0.0.1:0",
+			Server: "127.0.0.1:9",
+			MTU:    mtu,
+			FEC:    *fecOn,
+			Crypto: config.Crypto{Key: "psk", Cipher: "chacha20poly1305"},
+			WANs:   []config.WAN{{ID: "w1", Transport: config.TransportUDP, CapacityMbps: 100}},
+		}
+	}
+	if _, err := NewClient(base(1420), testLogger()); err == nil {
+		t.Fatal("MTU 1420 with FEC must be rejected (parity frames exceed path MTU)")
+	}
+	if _, err := NewClient(base(1390), testLogger()); err != nil {
+		t.Fatalf("MTU 1390 with FEC must be accepted: %v", err)
+	}
+}
+
+// TestParityFrameFitsPathMTU pins the P2 MTU math: the largest frame on the
+// wire (a parity frame with a max-size payload) must fit the path MTU
+// without IP fragmentation.
+func TestParityFrameFitsPathMTU(t *testing.T) {
+	const pathMTU = 1500
+	const k = 10
+	wire := func(innerMTU int) int {
+		return innerMTU + frame.HeaderSize + frame.TagSize + fec.ParityHeaderSize(k)
+	}
+	if got := wire(1390); got > pathMTU {
+		t.Fatalf("parity frame %dB exceeds path MTU %dB", got, pathMTU)
+	}
+	if got := wire(1420); got <= pathMTU {
+		t.Fatalf("expected parity frame at MTU 1420 to exceed path MTU, got %dB", got)
 	}
 }

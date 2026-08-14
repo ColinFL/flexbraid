@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ColinFL/flexbraid/internal/config"
@@ -62,8 +64,23 @@ type Client struct {
 	fecEnc *fec.Encoder // client → server
 	fecDec *fec.Decoder // server → client
 
+	// sendMu serializes batches of frames on the WAN transport so the
+	// ingress loop and the FEC tick loop cannot interleave frames and
+	// reorder them on the wire (P4).
+	sendMu sync.Mutex
+	// sendErrs throttles repeated send-failure logging (P6).
+	sendErrs atomic.Uint64
+	// oversizeErrs throttles MTU-exceeded logging (P6).
+	oversizeErrs atomic.Uint64
+
 	ingress *net.UDPConn // read-only after Start
 }
+
+// pathMTU is the assumed WAN path MTU for the inner-MTU check. The largest
+// frame on the wire is a parity frame: payload + FEC sub-header + frame
+// header + AEAD tag, and it must fit the path MTU without IP fragmentation
+// (a lost fragment would defeat FEC entirely — design §6.6).
+const pathMTU = 1500
 
 // fecParamsFromConfig derives codec params from the config. A disabled or
 // off-mode FEC yields pass-through codecs (no buffering, no parity).
@@ -91,7 +108,16 @@ func fecParamsFromConfig(cfg *config.Config) (fec.Params, error) {
 	if parity < 1 {
 		parity = 1
 	}
-	return fec.Params{DataShards: k, ParityShards: parity, BlockTimeout: timeout}, nil
+	params := fec.Params{DataShards: k, ParityShards: parity, BlockTimeout: timeout}
+	// P2: the largest parity frame must fit the path MTU without IP
+	// fragmentation. Fail fast with the exact bound instead of silently
+	// fragmenting (or dropping) parity frames.
+	if maxInner := pathMTU - frame.HeaderSize - frame.TagSize - fec.ParityHeaderSize(k); cfg.MTU > maxInner {
+		return fec.Params{}, fmt.Errorf(
+			"inner mtu %d too large with FEC(k=%d): parity frames need %d bytes of headroom on %d-byte paths; set mtu <= %d or disable FEC",
+			cfg.MTU, k, frame.HeaderSize+frame.TagSize+fec.ParityHeaderSize(k), pathMTU, maxInner)
+	}
+	return params, nil
 }
 
 // NewClient builds a tunnel client from config.
@@ -247,8 +273,16 @@ func (c *Client) handshakeLoop(ctx context.Context) {
 	}
 }
 
-// send seals and transmits one frame over the WAN transport.
+// send seals and transmits one frame over the WAN transport. P4: sendMu is
+// held for the whole call so a handshake frame cannot interleave with a data
+// batch; batch sends (sendEncoded) hold it across all frames of a block.
 func (c *Client) send(f *frame.Frame, aead cipher.AEAD) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return c.sendLocked(f, aead)
+}
+
+func (c *Client) sendLocked(f *frame.Frame, aead cipher.AEAD) error {
 	plain, err := f.Encode()
 	if err != nil {
 		return err
@@ -263,14 +297,38 @@ func (c *Client) send(f *frame.Frame, aead cipher.AEAD) error {
 // sendEncoded seals and transmits frames produced by the FEC encoder.
 // Data frames already carry their seq (assigned before Push, so the parity
 // sub-header records the true seqs); parity frames get a fresh seq here.
+// The whole block is sent under one hold of sendMu (P4): frames of one
+// block stay contiguous on the wire, and the ingress and FEC-tick loops
+// cannot interleave and reorder them.
 func (c *Client) sendEncoded(frames []*frame.Frame) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	for _, f := range frames {
 		if f.HasFlag(frame.FlagFECParity) {
 			f.Seq = c.sess.NextSeq()
 		}
-		if err := c.send(f, c.sessAEAD); err != nil {
-			c.log.Warn("send failed", "error", err)
+		if err := c.sendLocked(f, c.sessAEAD); err != nil {
+			c.noteSendErr(err)
 		}
+	}
+}
+
+// noteSendErr throttles repeated send-failure logging (P6): warn on the
+// first failure, then every 100th.
+func (c *Client) noteSendErr(err error) {
+	n := c.sendErrs.Add(1)
+	if n == 1 || n%100 == 0 {
+		c.log.Warn("send failures", "count", n, "last_error", err)
+	}
+}
+
+// noteOversize logs dropped inner datagrams that exceed the configured MTU,
+// throttled like send errors (P6).
+func (c *Client) noteOversize(n int) {
+	m := c.oversizeErrs.Add(1)
+	if m == 1 || m%100 == 0 {
+		c.log.Warn("dropped oversize inner datagram (mtu exceeded)",
+			"bytes", n, "mtu", c.cfg.MTU, "count", m)
 	}
 }
 
@@ -287,6 +345,13 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 		}
 		if c.sess.WGAddr() == nil {
 			c.sess.SetWGAddr(addr)
+		}
+		// Defense-in-depth: the config validation (fecParamsFromConfig)
+		// already bounds the MTU; drop anything that still exceeds it
+		// instead of letting an oversized frame hit the WAN.
+		if n > c.cfg.MTU {
+			c.noteOversize(n)
+			continue
 		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])

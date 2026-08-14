@@ -56,8 +56,15 @@ func (p Params) Enabled() bool { return p.ParityShards > 0 }
 //	[6+6k:]       max_len    — the parity shard itself
 const (
 	parityHdrFixed = 6
-	parityHdrSize  = parityHdrFixed + 4*DefaultDataShards + 2*DefaultDataShards
 )
+
+// ParityHeaderSize returns the byte size of the self-describing parity
+// sub-header for a codec with the given number of data shards. It is the
+// FEC-specific headroom that must be subtracted from the inner MTU so that
+// the largest parity frame still fits the path MTU (design §6.6).
+func ParityHeaderSize(dataShards int) int {
+	return parityHdrFixed + 4*dataShards + 2*dataShards
+}
 
 // Encoder turns data frames into FEC blocks. Safe for concurrent use
 // (Push from the data loop, Tick from the tunnel's ticker).
@@ -174,7 +181,7 @@ func (e *Encoder) emitBlock() []*frame.Frame {
 		f.BlockSeq = bs
 		out = append(out, f)
 	}
-	sub := make([]byte, parityHdrSize+maxLen)
+	sub := make([]byte, ParityHeaderSize(e.params.DataShards)+maxLen)
 	binary.BigEndian.PutUint16(sub[0:2], uint16(e.params.DataShards))
 	for i, f := range data {
 		binary.BigEndian.PutUint32(sub[parityHdrFixed+4*i:], f.Seq)
@@ -190,8 +197,8 @@ func (e *Encoder) emitBlock() []*frame.Frame {
 			Flags:     frame.FlagFECParity,
 		}
 		binary.BigEndian.PutUint16(sub[2:4], uint16(i))
-		copy(sub[parityHdrSize:], shards[e.params.DataShards+i])
-		pf.Payload = make([]byte, parityHdrSize+maxLen)
+		copy(sub[ParityHeaderSize(e.params.DataShards):], shards[e.params.DataShards+i])
+		pf.Payload = make([]byte, ParityHeaderSize(e.params.DataShards)+maxLen)
 		copy(pf.Payload, sub)
 		out = append(out, pf)
 	}

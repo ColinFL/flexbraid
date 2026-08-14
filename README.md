@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/FreeBSD-OPNsense-blue.svg)](#)
 [![Platforms](https://img.shields.io/badge/Linux-Debian-orange.svg)](#)
-![Status](https://img.shields.io/badge/Status-M1%20data%20path-blue.svg)
+![Status](https://img.shields.io/badge/Status-M2%20FEC-blue.svg)
 
 *Many WANs. One connection. No dropped sessions.*
 
@@ -42,8 +42,10 @@ traffic across your WANs and instantly re-routes around a dead one.
   OPNsense `WANFAIL`, `dpinger`, or any external monitor.
 - **Active load balancing**, weighted by each WAN's real bandwidth — or a
   **warm-standby** mode for near-zero-loss failover with no load splitting.
-- **Adaptive forward error correction** (Reed–Solomon) that follows the link —
-  and can be switched off entirely on clean lines.
+- **Forward error correction, fully disable-able** — Reed–Solomon erasure
+  coding with a tunable compensable-loss percentage per path (live adaptation
+  from measured loss arrives with the M3 health monitor), or switched off
+  entirely on clean lines.
 - **Flexible & configurable**: any number of WANs, per-link transport
   (`udp` / `faketcp` / `icmp`), per-link FEC %, scheduler policy, health
   thresholds — all from one YAML file.

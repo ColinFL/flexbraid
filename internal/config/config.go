@@ -81,7 +81,9 @@ type Queue struct {
 type FECMode string
 
 const (
-	// FECAdaptive adjusts redundancy from measured loss (recommended).
+	// FECAdaptive is the default mode. TODO(M3): adjust redundancy from the
+	// health monitor's measured loss in real time; until then it computes
+	// redundancy once from max_loss_pct at startup (M2 behaviour).
 	FECAdaptive FECMode = "adaptive"
 	// FECFixed keeps a constant configured overhead.
 	FECFixed FECMode = "fixed"

@@ -244,8 +244,11 @@ overhead = L / (1 − L)
 3. **FEC is per-path tunable.** Different WANs may have different quality.
 
 ### 6.3 Adaptive redundancy
-Instead of a fixed `-f 20:10` (UDPspeeder's model), the client computes the
-desired redundancy from the health monitor's loss estimate each interval:
+**M2 status:** redundancy is computed **once** from `max_loss_pct` at startup
+(`L / (1 − L)`, clamped ≥ 1 parity shard) — the code path is static today, and
+the mode name `adaptive` reflects the intended behaviour, not the current one.
+**TODO(M3):** with the health monitor in place, recompute the desired
+redundancy from the measured loss estimate each interval instead:
 
 ```
 target_overhead = clamp( L̂ / (1 − L̂) * (1 + safety_margin),
@@ -275,17 +278,23 @@ connections; you simply accept the link's raw loss. Useful on clean links or
 for latency-critical low-bandwidth use.
 
 ### 6.6 MTU & fragmentation
-FlexBraid advertises a **fixed MTU** to the inner layer (WireGuard) computed
-with headroom for every per-frame cost and the worst-case path:
+FlexBraid uses a **fixed inner MTU** with headroom for every per-frame cost.
+The largest frame on the wire is a **parity frame**: payload + self-describing
+parity sub-header + frame header + AEAD tag, and it must fit the path MTU
+without IP fragmentation (a lost fragment would defeat FEC entirely):
 ```
-inner_mtu = min_path_mtu − frame_header(24) − auth_tag(16) − max_fec_overhead − safety
+inner_mtu = min_path_mtu − frame_header(28) − auth_tag(16) − parity_subheader(k)
+parity_subheader(k) = 6 + 4k + 2k      # k = data shards (default 10 → 66 B)
 ```
-- The frame header + AEAD tag + the *maximum* configured FEC parity overhead
-  must fit inside every WAN's path MTU.
+- On a 1500-byte path with k=10: `1500 − 44 − 66 = 1390`. With FEC off the
+  parity sub-header disappears: `1500 − 44 = 1456` (1420 stays a safe default).
+- **M2 status:** enforced at startup — config validation rejects an `mtu` whose
+  parity frames would exceed the 1500-byte path MTU, and oversized inner
+  datagrams are dropped (defense-in-depth).
 - The `DF` bit is set; FlexBraid **never fragments** coded frames in the
   tunnel. Inner PMTUD (WireGuard handles this) adapts to the advertised MTU.
 - Per-path PMTU discovery is a future refinement (§10) for heterogeneous paths;
-  v1 uses a conservative fixed value (`mtu` config, default 1420).
+  v1 uses a conservative fixed value (`mtu` config, default 1420 without FEC).
 
 ---
 

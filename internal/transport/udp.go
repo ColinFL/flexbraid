@@ -15,6 +15,12 @@ type UDP struct {
 	remote   string // client: server address; server: ""
 	conn     *net.UDPConn
 	remoteIP *net.UDPAddr // client mode: the dialed peer
+
+	// readBuf is a single-reader scratch buffer: each transport has exactly
+	// one Recv loop (client recvLoop / server wanLoop), so one buffer can
+	// be reused. Recv returns an exact-size copy, so the returned slice is
+	// owned by the caller (FEC blocks may hold it until flushed).
+	readBuf [65535]byte
 }
 
 // NewUDP creates a UDP transport. In client mode remote is required; in
@@ -78,12 +84,15 @@ func (u *UDP) SendTo(addr net.Addr, b []byte) error {
 }
 
 func (u *UDP) Recv() ([]byte, net.Addr, error) {
-	buf := make([]byte, 65535)
-	n, addr, err := u.conn.ReadFromUDP(buf)
+	n, addr, err := u.conn.ReadFromUDP(u.readBuf[:])
 	if err != nil {
 		return nil, nil, err
 	}
-	return buf[:n], addr, nil
+	// Exact-size copy: the scratch buffer is reused on the next call, and
+	// the FEC decoder may hold the payload until its block is flushed.
+	out := make([]byte, n)
+	copy(out, u.readBuf[:n])
+	return out, addr, nil
 }
 
 func (u *UDP) Close() error {
