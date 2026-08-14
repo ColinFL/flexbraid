@@ -2,13 +2,17 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ColinFL/flexbraid/internal/config"
+	"github.com/ColinFL/flexbraid/internal/transport"
 )
 
 // testLogger silences the tunnel's own logging during tests.
@@ -70,7 +74,25 @@ func expectUDP(t *testing.T, conn *net.UDPConn, want string, timeout time.Durati
 // them plus the fake WG peer. Both are already Start()ed and running.
 func startTestPair(t *testing.T, psk string) (srv *Server, cli *Client, fakeWG, wgClient *net.UDPConn) {
 	t.Helper()
+	return startTestPairWithFEC(t, psk, nil)
+}
+
+// startTestPairWithFEC is startTestPair with an explicit FEC configuration.
+func startTestPairWithFEC(t *testing.T, psk string, fecCfg *config.FEC) (srv *Server, cli *Client, fakeWG, wgClient *net.UDPConn) {
+	t.Helper()
+	return startTestPairWrapped(t, psk, fecCfg, nil)
+}
+
+// startTestPairWrapped additionally wraps the client's WAN transport before
+// the tunnel starts (e.g. to inject loss). The wrapper must be safe to
+// install pre-start; runtime toggling must use atomic state.
+func startTestPairWrapped(t *testing.T, psk string, fecCfg *config.FEC, wrap func(transport.Transport) transport.Transport) (srv *Server, cli *Client, fakeWG, wgClient *net.UDPConn) {
+	t.Helper()
 	log := testLogger()
+	fecOpt := config.FEC{}
+	if fecCfg != nil {
+		fecOpt = *fecCfg
+	}
 
 	fakeWG, err := net.ListenUDP("udp", mustUDPAddr(t, "127.0.0.1:0"))
 	if err != nil {
@@ -82,6 +104,7 @@ func startTestPair(t *testing.T, psk string) (srv *Server, cli *Client, fakeWG, 
 		Mode:   config.ModeServer,
 		Listen: "127.0.0.1:0",
 		WGPeer: fakeWG.LocalAddr().String(),
+		FEC:    fecOpt,
 		Crypto: config.Crypto{Key: psk, Cipher: "chacha20poly1305"},
 	}
 	srv, err = NewServer(srvCfg, log)
@@ -99,6 +122,7 @@ func startTestPair(t *testing.T, psk string) (srv *Server, cli *Client, fakeWG, 
 		Mode:   config.ModeClient,
 		Listen: "127.0.0.1:0",
 		Server: srv.LocalAddr().String(),
+		FEC:    fecOpt,
 		Crypto: config.Crypto{Key: psk, Cipher: "chacha20poly1305"},
 		WANs: []config.WAN{{
 			ID: "w1", Transport: config.TransportUDP, CapacityMbps: 100,
@@ -107,6 +131,9 @@ func startTestPair(t *testing.T, psk string) (srv *Server, cli *Client, fakeWG, 
 	cli, err = NewClient(cliCfg, log)
 	if err != nil {
 		t.Fatalf("new client: %v", err)
+	}
+	if wrap != nil {
+		cli.wanTr = wrap(cli.wanTr)
 	}
 	if err := cli.Start(); err != nil {
 		t.Fatalf("client start: %v", err)
@@ -119,6 +146,51 @@ func startTestPair(t *testing.T, psk string) (srv *Server, cli *Client, fakeWG, 
 	}
 	t.Cleanup(func() { wgClient.Close() })
 	return srv, cli, fakeWG, wgClient
+}
+
+// waitFor polls fn until it returns true or the timeout elapses.
+func waitFor(t *testing.T, what string, fn func() bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// lossyTransport wraps a Transport and drops every Nth frame on Send once
+// enabled. It models a lossy WAN for end-to-end FEC tests. The wrapper must
+// be installed before the tunnel starts; loss is toggled atomically.
+type lossyTransport struct {
+	inner     transport.Transport
+	dropEvery int
+	enabled   atomic.Bool
+	mu        sync.Mutex
+	count     int
+}
+
+func (l *lossyTransport) ID() string                           { return l.inner.ID() }
+func (l *lossyTransport) Open() error                          { return l.inner.Open() }
+func (l *lossyTransport) LocalAddr() net.Addr                  { return l.inner.LocalAddr() }
+func (l *lossyTransport) SendTo(addr net.Addr, b []byte) error { return l.inner.SendTo(addr, b) }
+func (l *lossyTransport) Recv() ([]byte, net.Addr, error)      { return l.inner.Recv() }
+func (l *lossyTransport) Close() error                         { return l.inner.Close() }
+
+func (l *lossyTransport) Send(b []byte) error {
+	if !l.enabled.Load() {
+		return l.inner.Send(b)
+	}
+	l.mu.Lock()
+	l.count++
+	drop := l.count%l.dropEvery == 0
+	l.mu.Unlock()
+	if drop {
+		return nil // silently drop: the WAN ate the frame
+	}
+	return l.inner.Send(b)
 }
 
 // TestTunnelBidirectionalRoundTrip spins up a real server + client pair over
@@ -180,6 +252,53 @@ func TestTunnelRejectsWrongPSK(t *testing.T) {
 	}
 	if !sent {
 		t.Fatal("test setup broken: no packets sent")
+	}
+}
+
+// TestTunnelFECSurvivesPacketLoss proves FEC end-to-end: with 25% of frames
+// dropped on the WAN, the Reed–Solomon redundancy must recover every single
+// inner datagram (no retries from the sender side).
+func TestTunnelFECSurvivesPacketLoss(t *testing.T) {
+	lossy := &lossyTransport{dropEvery: 4}
+	lossy.enabled.Store(false)
+	srv, cli, fakeWG, wgClient := startTestPairWrapped(t, "fec-psk", &config.FEC{
+		Enabled:          true,
+		Mode:             config.FECFixed,
+		FixedOverheadPct: 40, // k=10, parity=4 → covers up to 4 losses/block
+		BlockTimeoutMS:   100,
+	}, func(inner transport.Transport) transport.Transport {
+		lossy.inner = inner
+		return lossy
+	})
+
+	// Wait for the handshake to establish the session (loss still off, so
+	// the FIRST frame is guaranteed to arrive).
+	waitFor(t, "server session", func() bool { return srv.mgr.Count() == 1 }, 3*time.Second)
+
+	// Now inject 25% loss on the client → server direction.
+	lossy.enabled.Store(true)
+
+	const n = 30
+	for i := 0; i < n; i++ {
+		if _, err := wgClient.WriteToUDP([]byte(fmt.Sprintf("ping-%02d", i)), cli.LocalAddr()); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Every ping must arrive at the WG peer despite the 25% frame loss.
+	got := make(map[string]bool)
+	buf := make([]byte, 65535)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(got) < n && time.Now().Before(deadline) {
+		_ = fakeWG.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		nn, _, err := fakeWG.ReadFromUDP(buf)
+		if err == nil {
+			got[string(buf[:nn])] = true
+		}
+	}
+	if len(got) != n {
+		t.Fatalf("only %d/%d pings survived 25%% frame loss — FEC failed: %v", len(got), n, got)
 	}
 }
 

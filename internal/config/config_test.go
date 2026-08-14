@@ -121,15 +121,12 @@ func TestCrosspathRequiresPacketAffinity(t *testing.T) {
 	if _, err := loadString(cfg); err == nil {
 		t.Error("expected error: crosspath FEC with flow affinity")
 	}
-	// with packet affinity it must be accepted
+	// with packet affinity the affinity check passes, but crosspath itself
+	// is not implemented until M4, so it must still be rejected
 	cfg = strings.Replace(sample, "mode: lb\n  balance_by: capacity", "mode: lb\n  affinity: packet\n  balance_by: capacity", 1)
 	cfg = strings.Replace(cfg, "mode: adaptive", "mode: crosspath", 1)
-	c, err := loadString(cfg)
-	if err != nil {
-		t.Fatalf("crosspath with packet affinity should be valid: %v", err)
-	}
-	if c.FEC.Mode != FECCrosspath || c.Scheduler.Affinity != AffinityPacket {
-		t.Errorf("unexpected config: fec=%s affinity=%s", c.FEC.Mode, c.Scheduler.Affinity)
+	if _, err := loadString(cfg); err == nil {
+		t.Fatal("crosspath must be rejected until M4 even with packet affinity")
 	}
 }
 

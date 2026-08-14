@@ -282,6 +282,12 @@ func (c *Config) Validate() error {
 		if c.FEC.BlockTimeoutMS <= 0 {
 			c.FEC.BlockTimeoutMS = 8
 		}
+		if c.FEC.Mode == FECFixed && (c.FEC.FixedOverheadPct <= 0 || c.FEC.FixedOverheadPct > 200) {
+			return fmt.Errorf("fec.fixed_overhead_pct must be in (0,200], got %v", c.FEC.FixedOverheadPct)
+		}
+		if c.FEC.Mode == FECCrosspath {
+			return fmt.Errorf("fec.mode=crosspath is not implemented until M4")
+		}
 	}
 
 	if len(c.WANs) == 0 {

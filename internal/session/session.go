@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/ColinFL/flexbraid/internal/crypto"
+	"github.com/ColinFL/flexbraid/internal/frame"
 )
 
 // ID is a 64-bit tunnel session identifier chosen by the client.
@@ -84,10 +85,18 @@ func (c *Client) WGAddr() *net.UDPAddr {
 	return c.wgAddr
 }
 
+// FrameCodec is the per-session FEC encoder contract the tunnel injects
+// into server sessions. It is satisfied by *fec.Encoder.
+type FrameCodec interface {
+	Push(*frame.Frame) []*frame.Frame
+	Tick(time.Time) []*frame.Frame
+}
+
 // ServerSession is the server-side state for one tunnel.
 type ServerSession struct {
 	ID     ID
 	aead   cipher.AEAD // per-session key (derived from PSK + session ID)
+	Enc    FrameCodec  // per-session FEC encoder (server → client), may be nil
 	seq    atomic.Uint32
 	replay crypto.ReplayWindow // client → server frames
 

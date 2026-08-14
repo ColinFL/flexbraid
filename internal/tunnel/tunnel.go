@@ -21,11 +21,13 @@ import (
 	"crypto/cipher"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"time"
 
 	"github.com/ColinFL/flexbraid/internal/config"
 	"github.com/ColinFL/flexbraid/internal/crypto"
+	"github.com/ColinFL/flexbraid/internal/fec"
 	"github.com/ColinFL/flexbraid/internal/frame"
 	"github.com/ColinFL/flexbraid/internal/session"
 	"github.com/ColinFL/flexbraid/internal/transport"
@@ -57,7 +59,39 @@ type Client struct {
 	sess     *session.Client
 	wanTr    transport.Transport
 
+	fecEnc *fec.Encoder // client → server
+	fecDec *fec.Decoder // server → client
+
 	ingress *net.UDPConn // read-only after Start
+}
+
+// fecParamsFromConfig derives codec params from the config. A disabled or
+// off-mode FEC yields pass-through codecs (no buffering, no parity).
+func fecParamsFromConfig(cfg *config.Config) (fec.Params, error) {
+	f := cfg.FEC
+	timeout := time.Duration(f.BlockTimeoutMS) * time.Millisecond
+	if !f.Enabled || f.Mode == config.FECOff {
+		return fec.Params{BlockTimeout: timeout}, nil
+	}
+	if f.Mode == config.FECCrosspath {
+		return fec.Params{}, fmt.Errorf("fec.mode %q is not implemented until M4 (requires scheduler.affinity: packet)",
+			config.FECCrosspath)
+	}
+	k := fec.DefaultDataShards
+	var parity int
+	switch f.Mode {
+	case config.FECFixed:
+		parity = int(math.Ceil(float64(k) * f.FixedOverheadPct / 100.0))
+	case config.FECAdaptive:
+		l := f.MaxLossPct / 100.0
+		parity = int(math.Ceil(float64(k) * l / (1 - l)))
+	default:
+		return fec.Params{}, fmt.Errorf("unknown fec.mode %q", f.Mode)
+	}
+	if parity < 1 {
+		parity = 1
+	}
+	return fec.Params{DataShards: k, ParityShards: parity, BlockTimeout: timeout}, nil
 }
 
 // NewClient builds a tunnel client from config.
@@ -98,14 +132,35 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 	}
 
 	wan := cfg.WANs[0]
-	return &Client{
+	c := &Client{
 		cfg:      cfg,
 		log:      log,
 		baseAEAD: baseAEAD,
 		sessAEAD: sessAEAD,
 		sess:     session.NewClientWithID(id),
 		wanTr:    transport.NewUDP(wan.ID, "", cfg.Server),
-	}, nil
+	}
+	params, err := fecParamsFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	c.fecEnc, err = fec.NewEncoder(params)
+	if err != nil {
+		return nil, fmt.Errorf("fec encoder: %w", err)
+	}
+	c.fecDec, err = fec.NewDecoder(params)
+	if err != nil {
+		return nil, fmt.Errorf("fec decoder: %w", err)
+	}
+	if params.Enabled() {
+		log.Info("fec enabled",
+			"data_shards", params.DataShards,
+			"parity_shards", params.ParityShards,
+			"block_timeout_ms", params.BlockTimeout.Milliseconds())
+	} else {
+		log.Info("fec disabled")
+	}
+	return c, nil
 }
 
 // Start binds the ingress socket and opens the WAN transport. It must be
@@ -143,6 +198,7 @@ func (c *Client) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go c.handshakeLoop(ctx)
+	go c.fecTickLoop(ctx)
 
 	recvDone := make(chan struct{})
 	go func() {
@@ -204,6 +260,20 @@ func (c *Client) send(f *frame.Frame, aead cipher.AEAD) error {
 	return c.wanTr.Send(sealed)
 }
 
+// sendEncoded seals and transmits frames produced by the FEC encoder.
+// Data frames already carry their seq (assigned before Push, so the parity
+// sub-header records the true seqs); parity frames get a fresh seq here.
+func (c *Client) sendEncoded(frames []*frame.Frame) {
+	for _, f := range frames {
+		if f.HasFlag(frame.FlagFECParity) {
+			f.Seq = c.sess.NextSeq()
+		}
+		if err := c.send(f, c.sessAEAD); err != nil {
+			c.log.Warn("send failed", "error", err)
+		}
+	}
+}
+
 // ingressLoop relays inner datagrams (WireGuard) into the tunnel.
 func (c *Client) ingressLoop(ctx context.Context) error {
 	buf := make([]byte, recvBufSize)
@@ -222,12 +292,10 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 		copy(payload, buf[:n])
 		f := &frame.Frame{
 			SessionID: uint64(c.sess.ID),
-			Seq:       c.sess.NextSeq(),
+			Seq:       c.sess.NextSeq(), // before Push: sub-header records true seqs
 			Payload:   payload,
 		}
-		if err := c.send(f, c.sessAEAD); err != nil {
-			c.log.Warn("send failed", "error", err)
-		}
+		c.sendEncoded(c.fecEnc.Push(f))
 	}
 }
 
@@ -246,12 +314,38 @@ func (c *Client) recvLoop() {
 		if f.HasFlag(frame.FlagControl) || f.HasFlag(frame.FlagKeepalive) || len(f.Payload) == 0 {
 			continue
 		}
-		addr := c.sess.WGAddr()
-		if addr == nil {
-			continue // no inner peer yet
-		}
+		c.deliverToWG(c.fecDec.Push(f))
+	}
+}
+
+// deliverToWG writes decoded inner datagrams to the inner WireGuard peer.
+func (c *Client) deliverToWG(frames []*frame.Frame) {
+	addr := c.sess.WGAddr()
+	if addr == nil {
+		return // no inner peer yet
+	}
+	for _, f := range frames {
 		if _, err := c.ingress.WriteToUDP(f.Payload, addr); err != nil {
 			c.log.Warn("egress to inner peer failed", "error", err)
+		}
+	}
+}
+
+// fecTickLoop flushes short FEC blocks on both directions.
+func (c *Client) fecTickLoop(ctx context.Context) {
+	interval := c.fecEnc.Params().BlockTimeout / 2
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			c.sendEncoded(c.fecEnc.Tick(now))
+			c.deliverToWG(c.fecDec.Tick(now))
 		}
 	}
 }

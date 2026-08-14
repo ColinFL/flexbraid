@@ -105,17 +105,36 @@ outbound frames into self-contained RS(`n`,`k`) blocks (data + parity on the
 same path). This keeps within-path FEC coherent regardless of the scheduler and
 is the enforcement of the FEC ↔ scheduler invariant (design §7.4).
 
-A block contains `k` data frames and `n−k` parity frames. Parity frames carry
-`FEC_PARITY` and reference the block's data-frame `seq`s so the decoder can map
-parity to the right data positions. A block is recoverable if at least `k` of
-its `n` frames arrive.
+A block contains `k` data frames and `n−k` parity frames. A block is
+recoverable if at least `k` of its `n` frames arrive.
 
-The encoder waits up to `fec.block_timeout_ms` to fill `k` data frames, then
-emits the parity. This bounds added latency.
+**Parity frames** carry `FEC_PARITY` and a **self-describing payload**
+(sub-header, all big-endian):
+
+```
+[0:2]   u16 k            — number of data frames in the block
+[2:4]   u16 parity index — this shard's position in the parity list
+[4:6]   u16 max_len      — padded shard size in bytes
+[6:6+4k]     k × u32     — data seqs of the block, in order
+[6+4k:6+6k]  k × u16     — original payload length of each data frame
+[6+6k:]       max_len    — the parity shard itself
+```
+
+The sub-header makes parity frames fully self-describing: the decoder needs no
+parameter negotiation, knows exactly which data frames are missing, and can
+reconstruct byte-exact payloads (including the length of a lost frame, which
+only lives in its own header). `k` is fixed per session in M2
+(`fec.DefaultDataShards = 10`), but the on-wire format carries it so it can
+vary freely.
+
+**Timing.** The encoder waits up to `fec.block_timeout_ms` to collect `k` data
+frames, then emits data + parity. A block with fewer than `k` frames at the
+timeout is flushed *without* parity (short block); the decoder delivers it on
+its own timeout. This bounds FEC latency for sparse traffic (e.g. keepalives).
 
 > Cross-path FEC (design §6.4) is a separate, optional mode that spans blocks
 > across **all** WANs; it is only valid with `scheduler.affinity: packet` and is
-> off by default.
+> not implemented until M4.
 
 ---
 

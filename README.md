@@ -115,11 +115,15 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 
 - **M0 — Foundation** *(done)*: repo, docs, config package + validation.
 - **M1 — Data path** *(done)*: session, framing, crypto (ChaCha20-Poly1305,
-  shared-PSK), anti-replay, UDP transport, one-WAN client/server tunnel —
-  integration-tested end-to-end.
-- **M2 — FEC:** RS encode/decode, adaptive redundancy.
+  shared-PSK, per-session keys), anti-replay, UDP transport, one-WAN
+  client/server tunnel — integration-tested end-to-end.
+- **M2 — FEC** *(done)*: Reed–Solomon erasure coding (per-WAN blocks,
+  self-describing parity, adaptive/fixed/off modes, short-block flush),
+  end-to-end loss recovery tests (25% frame loss → zero loss of inner
+  datagrams).
 - **M3 — Scheduler + health:** `lb`/`standby`, EWMA monitor, circuit breaker.
-- **M4 — Resilience:** endpoint migration, warm failover, FakeTCP/ICMP.
+- **M4 — Resilience:** endpoint migration, warm failover, FakeTCP/ICMP,
+  cross-path FEC.
 - **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging.
 
 See [DESIGN.md §14](docs/DESIGN.md#14-roadmap) for details.

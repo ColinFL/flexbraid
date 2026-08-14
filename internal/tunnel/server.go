@@ -10,6 +10,7 @@ import (
 
 	"github.com/ColinFL/flexbraid/internal/config"
 	"github.com/ColinFL/flexbraid/internal/crypto"
+	"github.com/ColinFL/flexbraid/internal/fec"
 	"github.com/ColinFL/flexbraid/internal/frame"
 	"github.com/ColinFL/flexbraid/internal/session"
 	"github.com/ColinFL/flexbraid/internal/transport"
@@ -28,13 +29,15 @@ const (
 // clients over the WAN transport and forwards inner datagrams to the
 // WireGuard peer over a connected egress socket.
 type Server struct {
-	cfg      *config.Config
-	log      *slog.Logger
-	psk      []byte // raw PSK, used to derive per-session keys
-	baseAEAD cipher.AEAD
-	mgr      *session.Manager
-	wanTr    transport.Transport
-	egress   *net.UDPConn // read-only after Start
+	cfg       *config.Config
+	log       *slog.Logger
+	psk       []byte // raw PSK, used to derive per-session keys
+	baseAEAD  cipher.AEAD
+	mgr       *session.Manager
+	wanTr     transport.Transport
+	fecParams fec.Params
+	fecDec    *fec.Decoder // client → server (all sessions)
+	egress    *net.UDPConn // read-only after Start
 }
 
 // NewServer builds a tunnel server from config.
@@ -53,13 +56,31 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cipher: %w", err)
 	}
+	params, err := fecParamsFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	fecDec, err := fec.NewDecoder(params)
+	if err != nil {
+		return nil, fmt.Errorf("fec decoder: %w", err)
+	}
+	if params.Enabled() {
+		log.Info("fec enabled",
+			"data_shards", params.DataShards,
+			"parity_shards", params.ParityShards,
+			"block_timeout_ms", params.BlockTimeout.Milliseconds())
+	} else {
+		log.Info("fec disabled")
+	}
 	return &Server{
-		cfg:      cfg,
-		log:      log,
-		psk:      []byte(cfg.Crypto.Key),
-		baseAEAD: baseAEAD,
-		mgr:      session.NewManager(),
-		wanTr:    transport.NewUDP("wan", cfg.Listen, ""),
+		cfg:       cfg,
+		log:       log,
+		psk:       []byte(cfg.Crypto.Key),
+		baseAEAD:  baseAEAD,
+		mgr:       session.NewManager(),
+		wanTr:     transport.NewUDP("wan", cfg.Listen, ""),
+		fecParams: params,
+		fecDec:    fecDec,
 	}, nil
 }
 
@@ -99,6 +120,9 @@ func (s *Server) Run(ctx context.Context) error {
 		defer close(sweepDone)
 		s.sweepLoop(ctx)
 	}()
+
+	// FEC block assembly timeouts (short blocks on both directions).
+	go s.fecTickLoop(ctx)
 
 	// Inner replies (WG → client) arrive on the egress socket; fan them out
 	// to every known session endpoint.
@@ -186,6 +210,13 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 				return
 			}
 			sess = session.NewServerSession(id, sessAEAD)
+			// Per-session FEC encoder: blocks must never mix sessions,
+			// because parity frames are sealed with the session's key.
+			enc, err := fec.NewEncoder(s.fecParams)
+			if err != nil {
+				return
+			}
+			sess.Enc = enc
 			s.mgr.Put(sess)
 		}
 		if !sess.CheckReplay(hdr.Seq) {
@@ -221,8 +252,15 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 	if len(f.Payload) == 0 {
 		return
 	}
-	if _, err := s.egress.Write(f.Payload); err != nil {
-		s.log.Warn("egress write failed", "error", err)
+	s.forwardToEgress(s.fecDec.Push(f))
+}
+
+// forwardToEgress writes decoded inner datagrams to the WG peer.
+func (s *Server) forwardToEgress(frames []*frame.Frame) {
+	for _, f := range frames {
+		if _, err := s.egress.Write(f.Payload); err != nil {
+			s.log.Warn("egress write failed", "error", err)
+		}
 	}
 }
 
@@ -259,24 +297,64 @@ func (s *Server) egressLoop() {
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 		for _, sess := range s.mgr.All() {
-			for pathID, ep := range sess.Endpoints() {
-				f := &frame.Frame{
-					SessionID: uint64(sess.ID),
-					Seq:       sess.NextSeq(),
-					Payload:   payload,
-				}
-				plain, err := f.Encode()
-				if err != nil {
-					continue
-				}
-				sealed, err := crypto.Seal(sess.AEAD(), crypto.DirServerToClient, plain)
-				if err != nil {
-					continue
-				}
-				if err := s.wanTr.SendTo(ep, sealed); err != nil {
-					s.log.Warn("reply send failed", "path", pathID, "error", err)
+			f := &frame.Frame{
+				SessionID: uint64(sess.ID),
+				Seq:       sess.NextSeq(), // before Push: sub-header records true seqs
+				Payload:   payload,
+			}
+			if sess.Enc != nil {
+				s.sendToSession(sess, sess.Enc.Push(f))
+			} else {
+				s.sendToSession(sess, []*frame.Frame{f})
+			}
+		}
+	}
+}
+
+// sendToSession seals frames with the session's key and delivers them to
+// every endpoint of the session. Data frames already carry their seq;
+// parity frames get a fresh seq here.
+func (s *Server) sendToSession(sess *session.ServerSession, frames []*frame.Frame) {
+	for _, f := range frames {
+		if f.HasFlag(frame.FlagFECParity) {
+			f.Seq = sess.NextSeq()
+		}
+		plain, err := f.Encode()
+		if err != nil {
+			continue
+		}
+		sealed, err := crypto.Seal(sess.AEAD(), crypto.DirServerToClient, plain)
+		if err != nil {
+			continue
+		}
+		for pathID, ep := range sess.Endpoints() {
+			if err := s.wanTr.SendTo(ep, sealed); err != nil {
+				s.log.Warn("reply send failed", "path", pathID, "error", err)
+			}
+		}
+	}
+}
+
+// fecTickLoop flushes short FEC blocks: session encoders (server → client)
+// and the shared decoder (client → server).
+func (s *Server) fecTickLoop(ctx context.Context) {
+	interval := s.fecParams.BlockTimeout / 2
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			for _, sess := range s.mgr.All() {
+				if sess.Enc != nil {
+					s.sendToSession(sess, sess.Enc.Tick(now))
 				}
 			}
+			s.forwardToEgress(s.fecDec.Tick(now))
 		}
 	}
 }

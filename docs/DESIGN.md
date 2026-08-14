@@ -510,8 +510,9 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
 - **M1 — Data path:** session, sequence, frame framing, crypto (ChaCha20-Poly1305,
   shared-PSK auth), UDP transport, one-WAN client/server that passes WireGuard
   traffic.
-- **M2 — FEC:** per-WAN RS encoder/decoder, adaptive redundancy, per-path
-  config, `off`.
+- **M2 — FEC** *(done, M2):* per-WAN RS encoder/decoder (self-describing
+  parity), `adaptive`/`fixed`/`off`, short-block flush; verified end-to-end
+  against 25% frame loss.
 - **M3 — Scheduler + health:** `lb` (flow-affine, capacity-weighted) and
   `standby` modes, EWMA monitoring, circuit breaker, graceful drain,
   delivery buffer (reorder+jitter), per-WAN queues/rate-limit.
