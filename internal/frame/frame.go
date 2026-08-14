@@ -35,6 +35,8 @@ const (
 	FlagControl uint8 = 1 << 2
 	// FlagFirst marks the first frame of a session (client handshake).
 	FlagFirst uint8 = 1 << 3
+	// FlagPong marks a keepalive reply (server → client, RTT probe echo).
+	FlagPong uint8 = 1 << 4
 )
 
 // Frame is a decoded or to-be-encoded frame. Payload holds the plaintext

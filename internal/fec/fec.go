@@ -205,9 +205,18 @@ func (e *Encoder) emitBlock() []*frame.Frame {
 	return out
 }
 
-// blockKey identifies a FEC block across sessions on the server side.
+// streamKey identifies one FEC stream: a session's frames on one path.
+// Blocks are per-path (M3): two WANs of the same session have independent
+// block sequences, so the decoder must never mix them.
+type streamKey struct {
+	sessionID uint64
+	path      string
+}
+
+// blockKey identifies a FEC block within a stream.
 type blockKey struct {
 	sessionID uint64
+	path      string
 	blockSeq  uint32
 }
 
@@ -235,7 +244,7 @@ type Decoder struct {
 	// frames arriving after their block was delivered (reconstructed or
 	// flushed on timeout) cannot create phantom blocks and duplicate
 	// delivery.
-	lastFlushed map[uint64]uint32
+	lastFlushed map[streamKey]uint32
 }
 
 // NewDecoder builds a decoder for the given params.
@@ -255,22 +264,25 @@ func NewDecoder(p Params) (*Decoder, error) {
 		}
 	}
 	return &Decoder{params: p, rs: rs, blocks: make(map[blockKey]*blockState),
-		lastFlushed: make(map[uint64]uint32)}, nil
+		lastFlushed: make(map[streamKey]uint32)}, nil
 }
 
-// Push accepts a data or parity frame and returns any data frames that can
-// now be delivered (in seq order). Frames of an already-flushed block are
-// dropped.
-func (d *Decoder) Push(f *frame.Frame) []*frame.Frame {
+// Push accepts a data or parity frame of a stream (session+path) and returns
+// any data frames that can now be delivered (in seq order). Frames of an
+// already-flushed block are dropped. The path identifies the WAN the frame
+// arrived on (M3): blocks are per-path, so two WANs' block sequences never
+// collide.
+func (d *Decoder) Push(path string, f *frame.Frame) []*frame.Frame {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.params.Enabled() {
 		return []*frame.Frame{f}
 	}
-	key := blockKey{sessionID: f.SessionID, blockSeq: f.BlockSeq}
+	key := blockKey{sessionID: f.SessionID, path: path, blockSeq: f.BlockSeq}
 	st := d.blocks[key]
 	if st == nil {
-		if d.lastFlushed[f.SessionID] >= key.blockSeq {
+		sk := streamKey{sessionID: f.SessionID, path: path}
+		if d.lastFlushed[sk] >= key.blockSeq {
 			return nil // block already delivered; late/duplicate frame
 		}
 		st = &blockState{
@@ -402,8 +414,9 @@ func (d *Decoder) reconstruct(key blockKey, st *blockState) []*frame.Frame {
 // flush emits the block's data frames in seq order and marks it done.
 func (d *Decoder) flush(key blockKey, st *blockState) []*frame.Frame {
 	st.flushed = true
-	if key.blockSeq > d.lastFlushed[key.sessionID] {
-		d.lastFlushed[key.sessionID] = key.blockSeq
+	sk := streamKey{sessionID: key.sessionID, path: key.path}
+	if key.blockSeq > d.lastFlushed[sk] {
+		d.lastFlushed[sk] = key.blockSeq
 	}
 	if len(st.seqs) == 0 {
 		// No parity ever arrived: emit whatever data we hold, sorted.
