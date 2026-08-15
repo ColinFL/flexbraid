@@ -117,6 +117,48 @@ func TestStandbyFailover(t *testing.T) {
 	}
 }
 
+// TestStandbySkipsDegraded: the standby must abandon a DEGRADED primary
+// immediately (loss beyond FEC capacity) — not wait for a hard failure.
+// Hierarchy: HEALTHY > DEGRADED > DOWN.
+func TestStandbySkipsDegraded(t *testing.T) {
+	s := New(Options{Mode: ModeStandby})
+	s.AddPath("primary", 100)
+	s.AddPath("backup", 50)
+
+	// Primary degrades: all traffic moves to the healthy backup.
+	s.OnState("primary", health.StateDegraded, 0.5)
+	for i := 0; i < 100; i++ {
+		id, _ := s.Pick(mkFrame(uint32(i)))
+		if id != "backup" {
+			t.Fatalf("standby must switch to backup while primary is DEGRADED, got %s", id)
+		}
+	}
+	// Backup degrades too: drain on the least-bad (config order = primary).
+	s.OnState("backup", health.StateDegraded, 0.6)
+	for i := 0; i < 100; i++ {
+		id, _ := s.Pick(mkFrame(uint32(i)))
+		if id != "primary" {
+			t.Fatalf("all-degraded standby must drain on config order (primary), got %s", id)
+		}
+	}
+	// Backup recovers: it becomes the sole healthy path and takes over.
+	s.OnState("backup", health.StateHealthy, 0)
+	for i := 0; i < 100; i++ {
+		id, _ := s.Pick(mkFrame(uint32(i)))
+		if id != "backup" {
+			t.Fatalf("healthy backup must carry traffic, got %s", id)
+		}
+	}
+	// Primary recovers: config order wins again.
+	s.OnState("primary", health.StateHealthy, 0)
+	for i := 0; i < 100; i++ {
+		id, _ := s.Pick(mkFrame(uint32(i)))
+		if id != "primary" {
+			t.Fatalf("standby must return to primary after recovery, got %s", id)
+		}
+	}
+}
+
 // TestFlowAffinityStable: with flow affinity, the same inner 4-tuple always
 // lands on the same WAN while the set is stable, and removing a path only
 // migrates its flows.

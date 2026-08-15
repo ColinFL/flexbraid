@@ -148,7 +148,16 @@ func (s *Scheduler) Pick(f *frame.Frame) (string, bool) {
 		return "", false
 	}
 	if s.opts.Mode == ModeStandby {
-		return usable[0].id, true // config order = priority
+		// Strict hierarchy HEALTHY > DEGRADED > DOWN: the standby must
+		// abandon a degraded active path (loss beyond FEC capacity)
+		// immediately, not wait for a hard failure — otherwise the whole
+		// point of near-zero-loss failover is lost.
+		for _, p := range usable {
+			if p.state == health.StateHealthy {
+				return p.id, true
+			}
+		}
+		return usable[0].id, true // all degraded: drain on the least-bad (config order)
 	}
 	if s.opts.Affinity == AffFlow {
 		if h, ok := parseInnerHash(f.Payload); ok {
