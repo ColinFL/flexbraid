@@ -61,6 +61,10 @@ type Options struct {
 	// DownAfterMisses is the number of consecutive unanswered probes that
 	// mark the path DOWN (default 3).
 	DownAfterMisses int
+	// DownGrace is a debounce applied before the DOWN transition once the
+	// missed-probe threshold is reached (anti-flap on jittery links).
+	// 0 = transition immediately, as before.
+	DownGrace time.Duration
 	// LossAlphaFast is the EWMA weight applied when a sample is worse than
 	// the current estimate (rise; default 0.4).
 	LossAlphaFast float64
@@ -77,6 +81,7 @@ type Monitor struct {
 	degradeAft  time.Duration
 	recoverAft  time.Duration
 	downAftMiss int
+	downGrace   time.Duration
 	alphaFast   float64
 	alphaSlow   float64
 	jitterAlpha float64
@@ -87,8 +92,13 @@ type Monitor struct {
 	jitter    time.Duration
 	state     State
 	misses    int // consecutive unanswered probes
+	missSince time.Time
 	condSince time.Time
 	revived   bool // a DOWN path has answered at least one probe again
+	// inBandBad counts consecutive in-band windows whose unrecovered loss
+	// exceeded the FEC capacity (ObserveInBand); 2 bad windows trip an
+	// immediate DEGRADED.
+	inBandBad int
 }
 
 // New builds a Monitor with the given options (defaults filled in).
@@ -105,6 +115,9 @@ func New(opts Options) *Monitor {
 	if opts.DownAfterMisses <= 0 {
 		opts.DownAfterMisses = 3
 	}
+	if opts.DownGrace < 0 {
+		opts.DownGrace = 0
+	}
 	if opts.LossAlphaFast <= 0 || opts.LossAlphaFast >= 1 {
 		opts.LossAlphaFast = 0.4
 	}
@@ -119,6 +132,7 @@ func New(opts Options) *Monitor {
 		degradeAft:  opts.DegradeAfter,
 		recoverAft:  opts.RecoverAfter,
 		downAftMiss: opts.DownAfterMisses,
+		downGrace:   opts.DownGrace,
 		alphaFast:   opts.LossAlphaFast,
 		alphaSlow:   opts.LossAlphaSlow,
 		jitterAlpha: opts.JitterAlpha,
@@ -152,28 +166,77 @@ func (m *Monitor) ObserveSample(loss float64, rtt time.Duration) {
 			m.rtt += time.Duration(m.jitterAlpha * float64(rtt-m.rtt))
 		}
 		m.jitter += time.Duration(m.jitterAlpha * float64(delta-m.jitter))
-		// A response: the path is alive again.
-		m.misses = 0
-		if m.state == StateDown && !m.revived {
-			// Hard reset on the first response after DOWN: the link is
-			// back, forget its dead past. Subsequent responses must NOT
-			// reset the recovery timer (revived stays true), or the path
-			// would never leave DOWN in steady state.
-			m.revived = true
-			m.loss = 0
-			m.condSince = time.Time{}
-		}
+		m.noteAliveLocked()
+	}
+}
+
+// NoteAlive records that the path answered — any authenticated frame counts
+// (data, keepalive, PONG). It resets the missed-probe counter and
+// hard-resets a DOWN path on its first response, without touching the
+// RTT/jitter estimates. This is the liveness signal for paths where RTT is
+// not measurable (e.g. the server side, which only sees keepalive arrivals).
+func (m *Monitor) NoteAlive() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.noteAliveLocked()
+}
+
+// noteAliveLocked is the shared response bookkeeping: a response means the
+// path is alive again.
+func (m *Monitor) noteAliveLocked() {
+	m.misses = 0
+	m.missSince = time.Time{}
+	if m.state == StateDown && !m.revived {
+		// Hard reset on the first response after DOWN: the link is
+		// back, forget its dead past. Subsequent responses must NOT
+		// reset the recovery timer (revived stays true), or the path
+		// would never leave DOWN in steady state.
+		m.revived = true
+		m.loss = 0
+		m.condSince = time.Time{}
 	}
 }
 
 // NoteMissedProbe records an unanswered probe. Enough consecutive misses
-// mark the path DOWN regardless of the loss EWMA.
+// mark the path DOWN — immediately (down_grace_sec = 0, the default) or
+// after the debounce window elapses, so a flapping link does not slam the
+// scheduler between states.
 func (m *Monitor) NoteMissedProbe() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.misses++
-	if m.misses >= m.downAftMiss && m.state != StateDown {
-		m.setState(StateDown)
+	if m.misses >= m.downAftMiss {
+		if m.downGrace <= 0 {
+			if m.state != StateDown {
+				m.setState(StateDown)
+			}
+		} else if m.missSince.IsZero() {
+			m.missSince = time.Now()
+		}
+	}
+}
+
+// ObserveInBand feeds the monitor from the FEC decoder's unrecovered-loss
+// rate on this path (lost/(lost+received) over the last window). Unlike
+// probes this signal is immediate under load: two consecutive windows whose
+// loss exceeds the FEC capacity force an instant HEALTHY → DEGRADED, so the
+// scheduler stops loading a path that FEC can no longer protect — no need
+// to wait for the probe-based DegradeAfter hysteresis.
+func (m *Monitor) ObserveInBand(lossRate float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lossRate > m.loss {
+		m.loss += m.alphaFast * (lossRate - m.loss)
+	} else {
+		m.loss += m.alphaSlow * (lossRate - m.loss)
+	}
+	if lossRate > m.maxLoss {
+		m.inBandBad++
+		if m.inBandBad >= 2 && m.state == StateHealthy {
+			m.setState(StateDegraded)
+		}
+	} else {
+		m.inBandBad = 0
 	}
 }
 
@@ -187,9 +250,13 @@ func (m *Monitor) Tick(now time.Time) {
 func (m *Monitor) tickLocked(now time.Time) {
 	// Condition timers: condSince tracks when the *current condition*
 	// started (not the state), so hysteresis uses sustained measurements.
+	// missedDown reports whether the missed-probe threshold is met,
+	// honouring the DOWN debounce window.
+	missedDown := m.misses >= m.downAftMiss &&
+		(m.downGrace <= 0 || (!m.missSince.IsZero() && now.Sub(m.missSince) >= m.downGrace))
 	switch m.state {
 	case StateHealthy:
-		if m.misses >= m.downAftMiss {
+		if missedDown {
 			m.setState(StateDown)
 			return
 		}
@@ -203,7 +270,7 @@ func (m *Monitor) tickLocked(now time.Time) {
 			m.condSince = time.Time{}
 		}
 	case StateDegraded:
-		if m.misses >= m.downAftMiss {
+		if missedDown {
 			m.setState(StateDown)
 			return
 		}

@@ -177,6 +177,96 @@ func TestDegradedRecovers(t *testing.T) {
 	}
 }
 
+// TestInBandImmediateDegrade: two consecutive in-band windows whose
+// unrecovered loss exceeds the FEC capacity force an instant DEGRADED —
+// no DegradeAfter hysteresis, no probe round-trip.
+func TestInBandImmediateDegrade(t *testing.T) {
+	m := New(fastOpts())
+	m.ObserveInBand(0.1) // below maxLoss (0.2): no reaction
+	if m.State() != StateHealthy {
+		t.Fatalf("loss below capacity must not degrade: %v", m.State())
+	}
+	m.ObserveInBand(0.5) // above capacity
+	if m.State() != StateHealthy {
+		t.Fatalf("premature degrade after a single bad window: %v", m.State())
+	}
+	m.ObserveInBand(0.5) // second consecutive bad window → instant DEGRADED
+	if m.State() != StateDegraded {
+		t.Fatalf("expected instant DEGRADED after 2 bad in-band windows, got %v", m.State())
+	}
+	// A clean window resets the counter; the estimate decays.
+	m.ObserveInBand(0)
+	if m.State() != StateDegraded {
+		t.Fatalf("state must not recover without the stability window: %v", m.State())
+	}
+}
+
+// TestDownGraceDebounce: with DownGrace set, the DOWN transition waits for
+// the debounce window after the missed-probe threshold; without it the
+// transition is immediate (TestMissedProbesMarkDown).
+func TestDownGraceDebounce(t *testing.T) {
+	opts := fastOpts()
+	opts.DownGrace = time.Second
+	m := New(opts)
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		m.NoteMissedProbe()
+	}
+	if m.State() != StateHealthy {
+		t.Fatalf("DOWN must be deferred by down_grace_sec, got %v", m.State())
+	}
+	// Threshold reached, but the debounce window has not elapsed.
+	m.Tick(now.Add(500 * time.Millisecond))
+	if m.State() != StateHealthy {
+		t.Fatalf("DOWN before the grace window elapsed: %v", m.State())
+	}
+	// A response before the window elapses cancels the pending DOWN.
+	m.ObserveSample(0, 5*time.Millisecond)
+	m.Tick(now.Add(2 * time.Second))
+	if m.State() != StateHealthy {
+		t.Fatalf("answered probe must cancel the pending DOWN: %v", m.State())
+	}
+	// Now let it run to completion: threshold + full grace → DOWN.
+	for i := 0; i < 3; i++ {
+		m.NoteMissedProbe()
+	}
+	m.Tick(now.Add(3 * time.Second))                       // grace (1s) not yet elapsed since last miss
+	m.Tick(now.Add(3*time.Second + 1500*time.Millisecond)) // elapsed → DOWN
+	if m.State() != StateDown {
+		t.Fatalf("expected DOWN after grace window, got %v", m.State())
+	}
+}
+
+// TestNoteAliveRevivesDownPath: any authenticated frame (no RTT needed)
+// hard-resets a DOWN path — this is how the server side revives, since it
+// only sees keepalive arrivals and measures no RTT.
+func TestNoteAliveRevivesDownPath(t *testing.T) {
+	m := New(fastOpts())
+	// Kill it.
+	for i := 0; i < 3; i++ {
+		m.NoteMissedProbe()
+	}
+	if m.State() != StateDown {
+		t.Fatalf("setup: expected DOWN, got %v", m.State())
+	}
+	// First frame after DOWN: hard reset.
+	m.NoteAlive()
+	if m.Loss() != 0 {
+		t.Fatalf("NoteAlive must hard-reset loss, got %v", m.Loss())
+	}
+	// Stability window still required before HEALTHY.
+	now := time.Now()
+	m.Tick(now.Add(100 * time.Millisecond))
+	if m.State() != StateDown {
+		t.Fatalf("revived too early: %v", m.State())
+	}
+	m.NoteAlive()
+	m.Tick(now.Add(700 * time.Millisecond))
+	if m.State() != StateHealthy {
+		t.Fatalf("expected HEALTHY after stability window, got %v", m.State())
+	}
+}
+
 // TestRTTAndJitterEstimates: EWMAs converge on the true values.
 func TestRTTAndJitterEstimates(t *testing.T) {
 	m := New(fastOpts())
