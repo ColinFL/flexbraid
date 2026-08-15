@@ -139,9 +139,97 @@ func TestKeyRequired(t *testing.T) {
 	}
 }
 
+// TestNewFieldsParse: the M3.1 config surface (per-WAN binding, FEC
+// geometry, delivery window, health debounce, capacity cap) parses.
+func TestNewFieldsParse(t *testing.T) {
+	cfg := `
+mode: client
+listen: 0.0.0.0:51820
+server: 203.0.113.1:4096
+scheduler:
+  mode: lb
+  affinity: packet
+  capacity_cap_mbps: 500
+fec:
+  enabled: true
+  mode: adaptive
+  data_shards: 4
+  max_loss_pct: 20
+  block_timeout_ms: 15
+wans:
+  - id: w1
+    transport: udp
+    iface: igc1
+    local_ip: 192.0.2.10
+    capacity_mbps: 300
+health:
+  probe_interval: 2
+  down_after_misses: 2
+  down_grace_sec: 1.5
+delivery:
+  gap_timeout_ms: 150
+  max_pending: 512
+crypto:
+  key: test-secret
+`
+	c, err := loadString(cfg)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if c.FEC.DataShards != 4 {
+		t.Errorf("data_shards = %d, want 4", c.FEC.DataShards)
+	}
+	if c.FEC.BlockTimeoutMS != 15 {
+		t.Errorf("block_timeout_ms = %d, want 15", c.FEC.BlockTimeoutMS)
+	}
+	if c.WANs[0].Iface != "igc1" || c.WANs[0].LocalIP != "192.0.2.10" {
+		t.Errorf("wan binding not parsed: %+v", c.WANs[0])
+	}
+	if c.Health.ProbeInterval != 2 || c.Health.DownAfterMisses != 2 || c.Health.DownGraceSec != 1.5 {
+		t.Errorf("health tuning not parsed: %+v", c.Health)
+	}
+	if c.Delivery.GapTimeoutMS != 150 || c.Delivery.MaxPending != 512 {
+		t.Errorf("delivery not parsed: %+v", c.Delivery)
+	}
+	if c.Scheduler.CapacityCapMbps != 500 {
+		t.Errorf("capacity_cap_mbps = %v, want 500", c.Scheduler.CapacityCapMbps)
+	}
+}
+
+// TestProbeIntervalDefaultsToOne: probes default to 1s (fast failover for
+// games), not the old 5s.
+func TestProbeIntervalDefaultsToOne(t *testing.T) {
+	c, err := loadString(sample)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if c.Health.ProbeInterval != 1 {
+		t.Errorf("probe_interval default = %v, want 1", c.Health.ProbeInterval)
+	}
+	if c.Delivery.GapTimeoutMS != 100 {
+		t.Errorf("gap_timeout_ms default = %d, want 100", c.Delivery.GapTimeoutMS)
+	}
+}
+
+// TestRemovedKnobsAreRejected: the removed config surface (queue, crypto
+// integrity_only) must fail loudly — Load uses KnownFields, so a config
+// still carrying a removed knob cannot silently pass.
+func TestRemovedKnobsAreRejected(t *testing.T) {
+	cfg := strings.Replace(sample, "cipher: chacha20poly1305", "cipher: chacha20poly1305\n  integrity_only: true", 1)
+	if _, err := loadString(cfg); err == nil {
+		t.Error("integrity_only was removed; unknown keys must be rejected")
+	}
+	cfg = strings.Replace(sample, "balance_by: capacity", "balance_by: capacity\n  queue:\n    max_pkts: 64", 1)
+	if _, err := loadString(cfg); err == nil {
+		t.Error("scheduler.queue was removed; unknown keys must be rejected")
+	}
+}
+
 func loadString(s string) (*Config, error) {
 	var c Config
-	if err := yaml.Unmarshal([]byte(s), &c); err != nil {
+	dec := yaml.NewDecoder(strings.NewReader(s))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil {
 		return nil, err
 	}
 	if err := c.Validate(); err != nil {

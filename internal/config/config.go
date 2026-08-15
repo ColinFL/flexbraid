@@ -9,6 +9,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
@@ -60,23 +61,6 @@ const (
 	AffinityPacket Affinity = "packet"
 )
 
-// DropPolicy selects what happens when a WAN send queue overflows.
-type DropPolicy string
-
-const (
-	// DropOldest drops the oldest queued frame (TCP learns to back off).
-	DropOldest DropPolicy = "drop-oldest"
-	// DropNewest drops the newest frame (real-time UDP wants latest state).
-	DropNewest DropPolicy = "drop-newest"
-)
-
-// Queue configures the bounded per-WAN send queue and rate limiting.
-type Queue struct {
-	MaxPkts       int        `yaml:"max_pkts"`        // bounded queue depth (BDP-aware)
-	RateLimitMbps float64    `yaml:"rate_limit_mbps"` // 0 = no explicit limiter (use capacity_mbps)
-	Drop          DropPolicy `yaml:"drop"`            // on overflow
-}
-
 // FECMode controls how forward error correction behaves.
 type FECMode string
 
@@ -108,18 +92,19 @@ const (
 
 // Config is the root configuration document.
 type Config struct {
-	Mode      Mode   `yaml:"mode"`
-	Listen    string `yaml:"listen"`
-	Server    string `yaml:"server"`
-	WGPeer    string `yaml:"wg_peer"`    // server mode: inner WireGuard peer (egress)
-	SessionID string `yaml:"session_id"` // auto | <hex> (server keys sessions by this, not source IP)
-	Scheduler Sched  `yaml:"scheduler"`
-	FEC       FEC    `yaml:"fec"`
-	MTU       int    `yaml:"mtu"` // inner MTU advertised to WireGuard (default 1420)
-	WANs      []WAN  `yaml:"wans"`
-	Health    Health `yaml:"health"`
-	Crypto    Crypto `yaml:"crypto"`
-	Log       Log    `yaml:"log"`
+	Mode      Mode     `yaml:"mode"`
+	Listen    string   `yaml:"listen"`
+	Server    string   `yaml:"server"`
+	WGPeer    string   `yaml:"wg_peer"`    // server mode: inner WireGuard peer (egress)
+	SessionID string   `yaml:"session_id"` // auto | <hex> (server keys sessions by this, not source IP)
+	Scheduler Sched    `yaml:"scheduler"`
+	FEC       FEC      `yaml:"fec"`
+	MTU       int      `yaml:"mtu"` // inner MTU advertised to WireGuard (default 1420)
+	WANs      []WAN    `yaml:"wans"`
+	Delivery  Delivery `yaml:"delivery"`
+	Health    Health   `yaml:"health"`
+	Crypto    Crypto   `yaml:"crypto"`
+	Log       Log      `yaml:"log"`
 }
 
 // Sched configures the packet scheduler / load balancer.
@@ -127,13 +112,30 @@ type Sched struct {
 	Mode      SchedulerMode `yaml:"mode"`
 	Affinity  Affinity      `yaml:"affinity"` // flow (default) | packet
 	BalanceBy BalanceBy     `yaml:"balance_by"`
-	Queue     Queue         `yaml:"queue"`
+	// CapacityCapMbps clamps the capacity a client may *declare* to the
+	// server (server-side trust boundary: the declared weight is
+	// untrusted input). 0 = no cap.
+	CapacityCapMbps float64 `yaml:"capacity_cap_mbps"`
+}
+
+// Delivery tunes the in-order reassembly window on the client.
+type Delivery struct {
+	// GapTimeoutMS bounds head-of-line blocking: a missing seq stalls
+	// delivery for at most this long, then the hole is skipped. Must
+	// cover the path RTT skew in packet-affinity mode (cable+LTE mixes
+	// routinely need 100ms+). Default 100.
+	GapTimeoutMS int `yaml:"gap_timeout_ms"`
+	// MaxPending caps the reorder buffer (BDP guard): frames beyond the
+	// cap are dropped oldest-first, so a stalled path cannot grow the
+	// buffer without bound. Default 4096.
+	MaxPending int `yaml:"max_pending"`
 }
 
 // FEC configures forward error correction. It can be fully disabled.
 type FEC struct {
 	Enabled          bool    `yaml:"enabled"`
 	Mode             FECMode `yaml:"mode"`
+	DataShards       int     `yaml:"data_shards"`        // data frames per block (default 10; games: 4–6)
 	MaxLossPct       float64 `yaml:"max_loss_pct"`       // compensable loss % per path
 	BlockTimeoutMS   int     `yaml:"block_timeout_ms"`   // block collection window (adds latency)
 	FixedOverheadPct float64 `yaml:"fixed_overhead_pct"` // overhead used when mode=fixed
@@ -143,7 +145,8 @@ type FEC struct {
 type WAN struct {
 	ID            string        `yaml:"id"`
 	Transport     TransportMode `yaml:"transport"`
-	Iface         string        `yaml:"iface"`            // bind device (optional, improves perf)
+	Iface         string        `yaml:"iface"`            // bind device (SO_BINDTODEVICE / IP_BOUND_IF); requires privilege
+	LocalIP       string        `yaml:"local_ip"`         // bind source address (fallback when iface bind is denied)
 	CapacityMbps  int           `yaml:"capacity_mbps"`    // declared bandwidth, used by balance_by=capacity
 	Weight        float64       `yaml:"weight"`           // manual multiplier (default 1.0)
 	FECMaxLossPct *float64      `yaml:"fec_max_loss_pct"` // per-path FEC override (nil = global)
@@ -151,20 +154,20 @@ type WAN struct {
 
 // Health tunes path monitoring and the circuit breaker.
 type Health struct {
-	LossAlphaFast float64 `yaml:"loss_alpha_fast"` // fast-rise EWMA weight (reacts to spikes)
-	LossAlphaSlow float64 `yaml:"loss_alpha_slow"` // slow-decay EWMA weight (settles down)
-	JitterAlpha   float64 `yaml:"jitter_alpha"`
-	DegradeSec    float64 `yaml:"degrade_sec"`    // sustained loss above cap -> DEGRADED (s)
-	RecoverMin    float64 `yaml:"recover_min"`    // stability window (min, fractional ok) before a path is restored
-	ProbeInterval float64 `yaml:"probe_interval"` // keepalive probe period (s); 0 -> 1s
-	DownGraceSec  float64 `yaml:"down_grace_sec"` // drain window before hard disable (s)
+	LossAlphaFast   float64 `yaml:"loss_alpha_fast"` // fast-rise EWMA weight (reacts to spikes)
+	LossAlphaSlow   float64 `yaml:"loss_alpha_slow"` // slow-decay EWMA weight (settles down)
+	JitterAlpha     float64 `yaml:"jitter_alpha"`
+	DegradeSec      float64 `yaml:"degrade_sec"`       // sustained loss above cap -> DEGRADED (s)
+	RecoverMin      float64 `yaml:"recover_min"`       // stability window (min, fractional ok) before a path is restored
+	ProbeInterval   float64 `yaml:"probe_interval"`    // keepalive probe period (s); 0 -> 1s
+	DownAfterMisses int     `yaml:"down_after_misses"` // consecutive unanswered probes -> DOWN (default 3)
+	DownGraceSec    float64 `yaml:"down_grace_sec"`    // debounce before the DOWN transition (s); 0 = immediate
 }
 
 // Crypto configures the tunnel's encryption/auth.
 type Crypto struct {
-	Key           string `yaml:"key"`            // shared PSK; AEAD keys derived from it (required)
-	Cipher        string `yaml:"cipher"`         // chacha20poly1305 | aes256gcm
-	IntegrityOnly bool   `yaml:"integrity_only"` // Poly1305 MAC over plaintext instead of full AEAD (WG already encrypts inner data)
+	Key    string `yaml:"key"`    // shared PSK; AEAD keys derived from it (required)
+	Cipher string `yaml:"cipher"` // chacha20poly1305 | aes256gcm
 }
 
 // Log controls logging.
@@ -180,7 +183,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	var c Config
-	if err := yaml.Unmarshal(data, &c); err != nil {
+	// KnownFields: a typo'd key is a hard error, not a silently ignored
+	// knob — FlexBraid's config surface is the product.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	if err := c.Validate(); err != nil {
@@ -247,16 +254,21 @@ func (c *Config) Validate() error {
 	if c.Scheduler.BalanceBy == "" {
 		c.Scheduler.BalanceBy = BalanceByCapacity
 	}
-	if c.Scheduler.Queue.MaxPkts == 0 {
-		c.Scheduler.Queue.MaxPkts = 1024
+	if c.Scheduler.CapacityCapMbps < 0 {
+		return fmt.Errorf("scheduler.capacity_cap_mbps cannot be negative")
 	}
-	if c.Scheduler.Queue.Drop == "" {
-		c.Scheduler.Queue.Drop = DropOldest
+
+	if c.Delivery.GapTimeoutMS == 0 {
+		c.Delivery.GapTimeoutMS = 100
 	}
-	switch c.Scheduler.Queue.Drop {
-	case DropOldest, DropNewest:
-	default:
-		return fmt.Errorf("invalid scheduler.queue.drop %q: must be %q or %q", c.Scheduler.Queue.Drop, DropOldest, DropNewest)
+	if c.Delivery.GapTimeoutMS < 10 || c.Delivery.GapTimeoutMS > 5000 {
+		return fmt.Errorf("delivery.gap_timeout_ms must be in [10,5000], got %d", c.Delivery.GapTimeoutMS)
+	}
+	if c.Delivery.MaxPending == 0 {
+		c.Delivery.MaxPending = 4096
+	}
+	if c.Delivery.MaxPending < 64 || c.Delivery.MaxPending > 1<<20 {
+		return fmt.Errorf("delivery.max_pending must be in [64,1048576], got %d", c.Delivery.MaxPending)
 	}
 
 	if c.MTU == 0 {
@@ -278,6 +290,12 @@ func (c *Config) Validate() error {
 		case FECAdaptive, FECFixed, FECCrosspath:
 		default:
 			return fmt.Errorf("invalid fec.mode %q", c.FEC.Mode)
+		}
+		if c.FEC.DataShards == 0 {
+			c.FEC.DataShards = 10
+		}
+		if c.FEC.DataShards < 2 || c.FEC.DataShards > 64 {
+			return fmt.Errorf("fec.data_shards must be in [2,64], got %d", c.FEC.DataShards)
 		}
 		if c.FEC.Mode == FECCrosspath && c.Scheduler.Affinity != AffinityPacket {
 			return fmt.Errorf("fec.mode=crosspath requires scheduler.affinity=packet")
@@ -344,7 +362,16 @@ func (c *Config) Validate() error {
 		c.Health.RecoverMin = 2
 	}
 	if c.Health.ProbeInterval == 0 {
-		c.Health.ProbeInterval = 5
+		c.Health.ProbeInterval = 1
+	}
+	if c.Health.DownAfterMisses == 0 {
+		c.Health.DownAfterMisses = 3
+	}
+	if c.Health.DownAfterMisses < 1 || c.Health.DownAfterMisses > 32 {
+		return fmt.Errorf("health.down_after_misses must be in [1,32], got %d", c.Health.DownAfterMisses)
+	}
+	if c.Health.DownGraceSec < 0 || c.Health.DownGraceSec > 60 {
+		return fmt.Errorf("health.down_grace_sec must be in [0,60], got %v", c.Health.DownGraceSec)
 	}
 
 	if c.Crypto.Key == "" {
