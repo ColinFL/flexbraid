@@ -1,18 +1,22 @@
 package transport
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"syscall"
 )
 
 // UDP is the plain encrypted-UDP wire format (transport mode "udp").
 //
-// Client mode dials the FlexBraid server once (Send → the server). Server
-// mode binds the listen socket and uses SendTo for per-path endpoints.
+// Client mode dials the FlexBraid server once (Send → the server), pinning
+// the socket to the WAN's device or source address when configured (Bind).
+// Server mode binds the listen socket and uses SendTo for per-path endpoints.
 type UDP struct {
 	id       string
 	local    string // server: bind address; client: "" (ephemeral)
 	remote   string // client: server address; server: ""
+	bind     Bind   // client: uplink pinning (iface → local_ip fallback)
 	conn     *net.UDPConn
 	remoteIP *net.UDPAddr // client mode: the dialed peer
 
@@ -25,8 +29,8 @@ type UDP struct {
 
 // NewUDP creates a UDP transport. In client mode remote is required; in
 // server mode local is required.
-func NewUDP(id, local, remote string) *UDP {
-	return &UDP{id: id, local: local, remote: remote}
+func NewUDP(id, local, remote string, bind Bind) *UDP {
+	return &UDP{id: id, local: local, remote: remote, bind: bind}
 }
 
 func (u *UDP) ID() string { return u.id }
@@ -41,17 +45,7 @@ func (u *UDP) LocalAddr() net.Addr {
 
 func (u *UDP) Open() error {
 	if u.remote != "" {
-		raddr, err := net.ResolveUDPAddr("udp", u.remote)
-		if err != nil {
-			return fmt.Errorf("udp[%s]: resolve %s: %w", u.id, u.remote, err)
-		}
-		conn, err := net.DialUDP("udp", nil, raddr)
-		if err != nil {
-			return fmt.Errorf("udp[%s]: dial %s: %w", u.id, u.remote, err)
-		}
-		u.conn = conn
-		u.remoteIP = raddr
-		return nil
+		return u.openClient()
 	}
 	// server mode: bind
 	laddr, err := net.ResolveUDPAddr("udp", u.local)
@@ -64,6 +58,55 @@ func (u *UDP) Open() error {
 	}
 	u.conn = conn
 	return nil
+}
+
+// openClient dials the server, pinning the socket to the WAN's device
+// (privileged) or source address (fallback). Without binding, the kernel
+// routes all WAN sockets through the default route and multi-WAN balancing
+// collapses onto one uplink.
+func (u *UDP) openClient() error {
+	raddr, err := net.ResolveUDPAddr("udp", u.remote)
+	if err != nil {
+		return fmt.Errorf("udp[%s]: resolve %s: %w", u.id, u.remote, err)
+	}
+	conn, err := u.dialBound(raddr)
+	if err != nil {
+		return fmt.Errorf("udp[%s]: dial %s: %w", u.id, u.remote, err)
+	}
+	u.conn = conn
+	u.remoteIP = raddr
+	return nil
+}
+
+// dialBound tries, in order: device binding (iface) → source binding
+// (local_ip) → plain dial. A permission error on the device bind is not
+// fatal when a local_ip fallback is configured (unprivileged daemons).
+func (u *UDP) dialBound(raddr *net.UDPAddr) (*net.UDPConn, error) {
+	if u.bind.Iface != "" {
+		iface := u.bind.Iface
+		d := &net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
+			return bindToDevice(c, iface)
+		}}
+		conn, err := dialUDP(d, raddr)
+		if err == nil {
+			return conn, nil
+		}
+		if !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EACCES) {
+			return nil, err // real failure, not a permissions issue
+		}
+		if u.bind.LocalIP == "" {
+			return nil, fmt.Errorf("bind to device %q denied (need root/CAP_NET_RAW); set wan.local_ip to bind the source address instead: %w", u.bind.Iface, err)
+		}
+	}
+	if u.bind.LocalIP != "" {
+		ip := net.ParseIP(u.bind.LocalIP)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid local_ip %q", u.bind.LocalIP)
+		}
+		d := &net.Dialer{LocalAddr: &net.UDPAddr{IP: ip}}
+		return dialUDP(d, raddr)
+	}
+	return net.DialUDP("udp", nil, raddr)
 }
 
 func (u *UDP) Send(b []byte) error {
