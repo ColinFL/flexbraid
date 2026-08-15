@@ -9,6 +9,48 @@ import (
 	"github.com/ColinFL/flexbraid/internal/crypto"
 )
 
+// TestCheckFirstReplay: a replayed handshake seq is rejected before any
+// session state exists; windows expire via ExpireFirsts.
+func TestCheckFirstReplay(t *testing.T) {
+	m := NewManager()
+	const id = ID(7)
+
+	if !m.CheckFirstReplay(id, 100) {
+		t.Fatal("first sight of a seq must be accepted")
+	}
+	if m.CheckFirstReplay(id, 100) {
+		t.Fatal("replayed handshake seq must be rejected")
+	}
+	if !m.CheckFirstReplay(id, 101) {
+		t.Fatal("a fresh seq must be accepted")
+	}
+	// Expiry: after ExpireFirsts the window is gone and the seq is
+	// accepted again (fresh window semantics). Negative TTL: on Windows
+	// time.Now() may return the same tick for both calls, so a zero TTL
+	// is unreliable (see TestManagerExpire).
+	m.ExpireFirsts(-time.Second)
+	if !m.CheckFirstReplay(id, 100) {
+		t.Fatal("post-expiry window must accept the seq again")
+	}
+}
+
+// TestCheckFirstReplayBounded: the handshake table stays bounded even under
+// a flood of distinct session IDs (the oldest entry is evicted).
+func TestCheckFirstReplayBounded(t *testing.T) {
+	m := NewManager()
+	for i := 0; i < maxFirstWindows+100; i++ {
+		if !m.CheckFirstReplay(ID(i+1), 1) {
+			t.Fatalf("fresh id %d rejected", i+1)
+		}
+	}
+	m.mu.Lock()
+	n := len(m.firstWindows)
+	m.mu.Unlock()
+	if n > maxFirstWindows {
+		t.Fatalf("firstWindows grew to %d, cap is %d", n, maxFirstWindows)
+	}
+}
+
 func testAEAD(t *testing.T) cipher.AEAD {
 	t.Helper()
 	key, err := crypto.DeriveKey([]byte("test-psk"))

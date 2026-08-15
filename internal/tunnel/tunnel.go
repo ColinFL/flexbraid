@@ -84,6 +84,10 @@ type wanLink struct {
 	// pongs / missedProbes count probe outcomes (telemetry + tests).
 	pongs        atomic.Uint64
 	missedProbes atomic.Uint64
+	// lastRx is the unix-nano time of the last VALID frame received on
+	// this WAN (any kind). Any traffic proves the path is alive, so a
+	// delayed PONG on a busy path is not mistaken for loss (P3).
+	lastRx atomic.Int64
 
 	// Keepalive probe state (keepaliveLoop + recvLoop).
 	probeMu    sync.Mutex
@@ -136,6 +140,9 @@ func fecParamsFor(cfg *config.Config, wan *config.WAN) (fec.Params, error) {
 			config.FECCrosspath)
 	}
 	k := fec.DefaultDataShards
+	if f.DataShards > 0 {
+		k = f.DataShards
+	}
 	var parity int
 	switch f.Mode {
 	case config.FECFixed:
@@ -155,6 +162,12 @@ func fecParamsFor(cfg *config.Config, wan *config.WAN) (fec.Params, error) {
 	if parity < 1 {
 		parity = 1
 	}
+	// Reed–Solomon field bound: klauspost/reedsolomon supports at most
+	// 256 shards per block. A large k combined with a high max_loss_pct
+	// can exceed it; fail fast with the exact constraint.
+	if k+parity > 256 {
+		return fec.Params{}, fmt.Errorf("fec geometry too large: k=%d + parity=%d > 256 (reduce data_shards or max_loss_pct)", k, parity)
+	}
 	params := fec.Params{DataShards: k, ParityShards: parity, BlockTimeout: timeout}
 	// P2: the largest parity frame must fit the path MTU without IP
 	// fragmentation. Fail fast with the exact bound instead of silently
@@ -171,7 +184,9 @@ func fecParamsFor(cfg *config.Config, wan *config.WAN) (fec.Params, error) {
 // (0 when disabled) — the health monitor's degrade threshold.
 func fecCompensableLoss(p fec.Params) float64 {
 	if !p.Enabled() {
-		return 0.10 // no FEC: any sustained loss above 10% is non-compensable
+		// No FEC means no compensable loss, period. The caller maps this
+		// to a tiny EWMA noise floor so the state machine stays sane.
+		return 0
 	}
 	return float64(p.ParityShards) / float64(p.DataShards+p.ParityShards)
 }
@@ -197,6 +212,17 @@ func effectiveCapacity(wan config.WAN, p fec.Params, balanceBy config.BalanceBy)
 	return cap
 }
 
+// monitorMaxLoss maps FEC capacity onto the health monitor's degrade
+// threshold. No FEC → 0 compensable loss, expressed as a 1% EWMA noise
+// floor so the state machine keeps working (a strict 0 would make the
+// recovery condition unreachable).
+func monitorMaxLoss(p fec.Params) float64 {
+	if l := fecCompensableLoss(p); l > 0 {
+		return l
+	}
+	return 0.01
+}
+
 // healthOptions maps the config's health section onto monitor options.
 func healthOptions(h config.Health, maxLoss float64, probeInterval time.Duration) health.Options {
 	return health.Options{
@@ -206,7 +232,8 @@ func healthOptions(h config.Health, maxLoss float64, probeInterval time.Duration
 		LossAlphaFast:   h.LossAlphaFast,
 		LossAlphaSlow:   h.LossAlphaSlow,
 		JitterAlpha:     h.JitterAlpha,
-		DownAfterMisses: 3,
+		DownAfterMisses: h.DownAfterMisses,
+		DownGrace:       time.Duration(h.DownGraceSec * float64(time.Second)),
 	}
 }
 
@@ -284,7 +311,7 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		wan := &wanLink{
 			id:     wcfg.ID,
 			cfg:    *wcfg,
-			tr:     transport.NewUDP(wcfg.ID, "", cfg.Server),
+			tr:     transport.NewUDP(wcfg.ID, "", cfg.Server, transport.Bind{Iface: wcfg.Iface, LocalIP: wcfg.LocalIP}),
 			enc:    enc,
 			dec:    dec,
 			health: mon,
@@ -298,9 +325,12 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 			"capacity_mbps", wcfg.CapacityMbps,
 			"fec", fecSummary(params))
 	}
-	// Delivery buffer: gap timeout covers FEC block assembly + path skew.
-	gapTimeout := 2*time.Duration(cfg.FEC.BlockTimeoutMS)*time.Millisecond + 25*time.Millisecond
-	c.delivery = newDeliveryBuffer(gapTimeout)
+	// Delivery buffer: gap timeout covers FEC block assembly + path RTT
+	// skew (configurable; 100ms default for mixed cable+LTE uplinks).
+	c.delivery = newDeliveryBuffer(
+		time.Duration(cfg.Delivery.GapTimeoutMS)*time.Millisecond,
+		cfg.Delivery.MaxPending,
+	)
 	return c, nil
 }
 
@@ -433,8 +463,13 @@ func (c *Client) handshakeLoop(ctx context.Context, wan *wanLink) {
 
 // keepaliveLoop probes one WAN every probeInterval with a KEEPALIVE frame;
 // the server answers with a PONG carrying the same timestamp, giving the
-// client a per-WAN loss + RTT sample. Loss is measured per interval: at each
-// tick, the previous probe either was answered (loss 0) or not (loss 1).
+// client a per-WAN loss + RTT sample.
+//
+// A probe counts as MISSED only when the path is otherwise silent: if any
+// valid frame (data or control) arrived on this WAN since the probe was
+// sent, the path is alive and the PONG is merely delayed (jitter under
+// load) — marking it lost would false-trip the circuit breaker on a busy
+// link and stall traffic (P3).
 func (c *Client) keepaliveLoop(ctx context.Context, wan *wanLink) {
 	send := func() {
 		payload := make([]byte, 8)
@@ -466,9 +501,17 @@ func (c *Client) keepaliveLoop(ctx context.Context, wan *wanLink) {
 			rtt := wan.probeRTT
 			wan.probeMu.Unlock()
 			if wasOut {
-				wan.health.NoteMissedProbe()
-				wan.health.ObserveSample(1, 0)
-				wan.missedProbes.Add(1)
+				sinceRx := time.Since(time.Unix(0, wan.lastRx.Load()))
+				if sinceRx > 2*c.probeInterval {
+					// No frame at all on this path since the probe: a real
+					// loss sample.
+					wan.health.NoteMissedProbe()
+					wan.health.ObserveSample(1, 0)
+					wan.missedProbes.Add(1)
+				} else {
+					// Traffic is flowing; the PONG is just late.
+					wan.health.ObserveSample(0, 0)
+				}
 			} else {
 				wan.health.ObserveSample(0, rtt)
 			}
@@ -569,7 +612,15 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 			}
 			return fmt.Errorf("ingress read: %w", err)
 		}
-		if c.sess.WGAddr() == nil {
+		// Roaming: the inner WireGuard peer may change its source
+		// address (NAT rebind, Wi-Fi→LTE switch on the LAN side, WG
+		// restart). Always adopt the latest authenticated source — it
+		// is the address replies must go to.
+		if prev := c.sess.WGAddr(); prev == nil || prev.String() != addr.String() {
+			if prev != nil {
+				c.log.Info("inner peer address changed (roaming)",
+					"old", prev.String(), "new", addr.String())
+			}
 			c.sess.SetWGAddr(addr)
 		}
 		// Defense-in-depth: the config validation (fecParamsFor) already
@@ -609,6 +660,9 @@ func (c *Client) recvLoop(wan *wanLink) {
 		if !ok {
 			continue
 		}
+		// Any valid frame proves the path is alive (liveness signal for
+		// the circuit breaker; keeps delayed-PONG false trips at bay).
+		wan.lastRx.Store(time.Now().UnixNano())
 		if f.HasFlag(frame.FlagPong) {
 			c.handlePong(wan, f)
 			continue
@@ -659,7 +713,8 @@ func (c *Client) fecTickLoop(ctx context.Context) {
 
 // healthTickLoop advances every WAN's circuit breaker and pushes state
 // changes into the scheduler, which is what actually removes a bad path from
-// rotation (or restores it after recovery).
+// rotation (or restores it after recovery). In-band loss samples from each
+// WAN's FEC decoder feed the monitors alongside the keepalive probes.
 func (c *Client) healthTickLoop(ctx context.Context) {
 	t := time.NewTicker(200 * time.Millisecond)
 	defer t.Stop()
@@ -669,6 +724,14 @@ func (c *Client) healthTickLoop(ctx context.Context) {
 			return
 		case now := <-t.C:
 			for _, wan := range c.wans {
+				// In-band signal: unrecovered loss on this path, measured
+				// from real traffic. Instant under load — no probe latency.
+				if lost, received := wan.dec.TakeStreamStats(uint64(c.sess.ID), wan.id); received > 0 {
+					rate := float64(lost) / float64(lost+received)
+					if rate > 0 {
+						wan.health.ObserveInBand(rate)
+					}
+				}
 				before := wan.health.State()
 				wan.health.Tick(now)
 				after := wan.health.State()

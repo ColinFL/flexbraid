@@ -46,11 +46,14 @@ const (
 
 // pathState is the server's per-path view of one client session: the
 // endpoint address, the client-declared capacity and the health monitor.
+// lastArrive/lastKeepalive are atomic (unix nanos): written by the wanLoop
+// goroutine, read by the health tick loop.
 type pathState struct {
-	addr       *net.UDPAddr
-	capacity   float64
-	health     *health.Monitor
-	lastArrive time.Time // last keepalive arrival (loss measurement)
+	addr          *net.UDPAddr
+	capacity      float64
+	health        *health.Monitor
+	lastArrive    atomic.Int64 // last frame of ANY kind on this path (liveness)
+	lastKeepalive atomic.Int64 // last keepalive arrival (loss measurement)
 }
 
 // sessState is the server's scheduling state for one client session.
@@ -126,7 +129,7 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		psk:       []byte(cfg.Crypto.Key),
 		baseAEAD:  baseAEAD,
 		mgr:       session.NewManager(),
-		wanTr:     transport.NewUDP("wan", cfg.Listen, ""),
+		wanTr:     transport.NewUDP("wan", cfg.Listen, "", transport.Bind{}),
 		fecParams: params,
 		fecDec:    fecDec,
 		states:    make(map[session.ID]*sessState),
@@ -197,6 +200,9 @@ func (s *Server) sweepLoop(ctx context.Context) {
 		case <-t.C:
 			if n := s.mgr.Expire(sessionTTL); n > 0 {
 				s.log.Info("expired idle sessions", "count", n)
+			}
+			if n := s.mgr.ExpireFirsts(sessionTTL); n > 0 {
+				s.log.Info("expired handshake replay windows", "count", n)
 			}
 			s.statesMu.Lock()
 			for id := range s.states {
@@ -278,6 +284,13 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 				s.log.Warn("session table full, dropping handshake",
 					"session", fmt.Sprintf("%016x", uint64(id)))
 				return
+			}
+			// Handshake anti-replay (P8): a replayed captured FIRST must not
+			// create a session (each one dials an egress socket and spawns a
+			// goroutine — a replay loop would be a memory/socket DoS). The
+			// per-ID window is checked before ANY state is created.
+			if !s.mgr.CheckFirstReplay(id, hdr.Seq) {
+				return // replayed handshake
 			}
 			// Dial the session's dedicated egress socket to the WG peer.
 			// Replies from the WG peer will return on this socket, which is
@@ -371,24 +384,27 @@ func (s *Server) registerPath(sess *session.ServerSession, ua *net.UDPAddr, payl
 		if len(st.paths) >= maxPathsPerSession {
 			return // path cap reached; keep serving known paths only
 		}
-		mon := health.New(health.Options{
-			MaxLoss:         fecCompensableLoss(s.fecParams),
-			DegradeAfter:    time.Duration(s.cfg.Health.DegradeSec * float64(time.Second)),
-			RecoverAfter:    time.Duration(s.cfg.Health.RecoverMin * float64(time.Minute)),
-			LossAlphaFast:   s.cfg.Health.LossAlphaFast,
-			LossAlphaSlow:   s.cfg.Health.LossAlphaSlow,
-			JitterAlpha:     s.cfg.Health.JitterAlpha,
-			DownAfterMisses: 3,
-		})
+		mon := health.New(healthOptions(s.cfg.Health, monitorMaxLoss(s.fecParams), 0))
 		ps = &pathState{addr: ua, capacity: 1, health: mon}
+		ps.lastArrive.Store(time.Now().UnixNano())
 		st.paths[pathKey] = ps
 		st.sched.AddPath(pathKey, 1)
 		s.log.Info("client path registered",
 			"session", fmt.Sprintf("%016x", uint64(sess.ID)),
 			"path", pathKey)
 	}
+	// Any authenticated frame on this path is a liveness signal: the
+	// silence watchdog in healthTickLoop uses it, so a busy path cannot
+	// be marked DOWN from probe jitter alone.
+	ps.lastArrive.Store(time.Now().UnixNano())
 	if len(payload) >= 4 {
 		capMbps := float64(binary.BigEndian.Uint32(payload[:4]))
+		// Trust boundary: the client-declared capacity is untrusted input —
+		// a lying client must not be able to grab the server's whole
+		// outbound share. Clamp to the server-configured cap (0 = no cap).
+		if cap := s.cfg.Scheduler.CapacityCapMbps; cap > 0 && capMbps > cap {
+			capMbps = cap
+		}
 		if capMbps != ps.capacity {
 			ps.capacity = capMbps
 			st.sched.AddPath(pathKey, s.effectiveCapacityFor(capMbps))
@@ -403,8 +419,12 @@ func (s *Server) effectiveCapacityFor(capMbps float64) float64 {
 	return effectiveCapacity(config.WAN{CapacityMbps: int(capMbps)}, s.fecParams, s.cfg.Scheduler.BalanceBy)
 }
 
-// observeKeepalive feeds the path's health monitor from probe arrivals:
-// a gap larger than the probe period means probes were lost.
+// observeKeepalive feeds the path's health monitor from probe arrivals.
+//
+// A keepalive counts as LOST only when the path is otherwise silent: if
+// data frames are flowing, a late keepalive is jitter, not loss — marking
+// it missed would false-trip the circuit breaker on a busy path. Total
+// silence is handled by the watchdog in healthTickLoop.
 func (s *Server) observeKeepalive(sess *session.ServerSession, pathKey string, ua *net.UDPAddr) {
 	st := s.stateFor(sess.ID)
 	ps := st.paths[pathKey]
@@ -412,18 +432,27 @@ func (s *Server) observeKeepalive(sess *session.ServerSession, pathKey string, u
 		return // not registered (path cap) — ignore
 	}
 	now := time.Now()
-	if ps.lastArrive.IsZero() {
-		ps.lastArrive = now
-		return
-	}
-	gap := now.Sub(ps.lastArrive)
-	ps.lastArrive = now
 	interval := time.Duration(s.cfg.Health.ProbeInterval) * time.Second
 	if interval <= 0 {
 		interval = defaultProbeInterval
 	}
-	if gap > 2*interval {
+	// Liveness: the keepalive itself is a genuine response.
+	ps.health.NoteAlive()
+	lastKA := time.Unix(0, ps.lastKeepalive.Load())
+	if lastKA.IsZero() {
+		ps.lastKeepalive.Store(now.UnixNano())
+		ps.health.ObserveSample(0, 0)
+		return
+	}
+	gap := now.Sub(lastKA)
+	ps.lastKeepalive.Store(now.UnixNano())
+	lastArr := time.Unix(0, ps.lastArrive.Load())
+	if gap > 2*interval && now.Sub(lastArr) > 2*interval {
+		// No keepalive AND no data for two intervals: a real loss sample.
 		missed := int(gap/interval) - 1
+		if missed > 8 {
+			missed = 8
+		}
 		for i := 0; i < missed; i++ {
 			ps.health.NoteMissedProbe()
 		}
@@ -615,6 +644,10 @@ func (s *Server) healthTickLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
+			interval := time.Duration(s.cfg.Health.ProbeInterval) * time.Second
+			if interval <= 0 {
+				interval = defaultProbeInterval
+			}
 			s.statesMu.Lock()
 			for id, st := range s.states {
 				sess := s.mgr.Get(id)
@@ -622,6 +655,32 @@ func (s *Server) healthTickLoop(ctx context.Context) {
 					continue
 				}
 				for pathKey, ps := range st.paths {
+					// Silence watchdog: when NOTHING arrives on a path for
+					// several probe intervals — no data, no keepalives — it
+					// is dead regardless of what the loss EWMA says. This
+					// closes the hole where probe-gap detection only fires
+					// on arrival (total silence produced no signal at all).
+					if lastArr := time.Unix(0, ps.lastArrive.Load()); !lastArr.IsZero() {
+						silence := now.Sub(lastArr)
+						if silence > 3*interval {
+							missed := int(silence/interval) - 2
+							if missed > 4 {
+								missed = 4
+							}
+							for i := 0; i < missed; i++ {
+								ps.health.NoteMissedProbe()
+							}
+							ps.health.ObserveSample(1, 0)
+						}
+					}
+					// In-band signal: unrecovered loss on this client path,
+					// from the shared decoder's per-stream counters.
+					if lost, received := s.fecDec.TakeStreamStats(uint64(id), pathKey); received > 0 {
+						rate := float64(lost) / float64(lost+received)
+						if rate > 0 {
+							ps.health.ObserveInBand(rate)
+						}
+					}
 					before := ps.health.State()
 					ps.health.Tick(now)
 					after := ps.health.State()

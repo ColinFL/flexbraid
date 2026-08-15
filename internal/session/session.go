@@ -181,11 +181,70 @@ func (s *ServerSession) Endpoints() map[string]*net.UDPAddr {
 type Manager struct {
 	mu       sync.Mutex
 	sessions map[ID]*ServerSession
+	// firstWindows holds handshake anti-replay state for sessions that do
+	// not exist yet (P8): a replayed captured FIRST frame must not be able
+	// to create a session — each creation dials an egress socket and
+	// spawns a goroutine, so an unbounded replay loop would be a socket
+	// and memory DoS. Entries expire via ExpireFirsts.
+	firstWindows map[ID]*firstWindow
 }
+
+// firstWindow is the anti-replay window for one not-yet-existing session.
+type firstWindow struct {
+	win     *crypto.ReplayWindow
+	created time.Time
+}
+
+// maxFirstWindows bounds the handshake replay table (anti-DoS).
+const maxFirstWindows = 4096
 
 // NewManager creates an empty session manager.
 func NewManager() *Manager {
-	return &Manager{sessions: make(map[ID]*ServerSession)}
+	return &Manager{
+		sessions:     make(map[ID]*ServerSession),
+		firstWindows: make(map[ID]*firstWindow),
+	}
+}
+
+// CheckFirstReplay validates a FIRST-frame seq for a session that does not
+// exist yet, creating the per-ID window on first sight. Returns false for a
+// replayed or too-old seq. Only meaningful before a session exists; once
+// the session is up its own window takes over.
+func (m *Manager) CheckFirstReplay(id ID, seq uint32) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fw := m.firstWindows[id]
+	if fw == nil {
+		if len(m.firstWindows) >= maxFirstWindows {
+			// Table full: evict the oldest entry to stay bounded.
+			var oldest ID
+			var oldestT time.Time
+			for k, v := range m.firstWindows {
+				if oldestT.IsZero() || v.created.Before(oldestT) {
+					oldest, oldestT = k, v.created
+				}
+			}
+			delete(m.firstWindows, oldest)
+		}
+		fw = &firstWindow{win: crypto.NewReplayWindow(crypto.DefaultReplayWindow), created: time.Now()}
+		m.firstWindows[id] = fw
+	}
+	return fw.win.CheckAndMark(seq)
+}
+
+// ExpireFirsts drops handshake replay windows older than ttl.
+func (m *Manager) ExpireFirsts(ttl time.Duration) int {
+	cutoff := time.Now().Add(-ttl)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for id, fw := range m.firstWindows {
+		if fw.created.Before(cutoff) {
+			delete(m.firstWindows, id)
+			n++
+		}
+	}
+	return n
 }
 
 // Get returns the session with the given ID, or nil.

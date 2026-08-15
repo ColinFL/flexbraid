@@ -26,16 +26,21 @@ type deliveryBuffer struct {
 	pending    map[uint32]*frame.Frame
 	gapSince   time.Time // when next became missing (zero = no gap)
 	gapTimeout time.Duration
+	maxPending int // BDP guard: drop-oldest bound on pending
 }
 
-func newDeliveryBuffer(gapTimeout time.Duration) *deliveryBuffer {
+func newDeliveryBuffer(gapTimeout time.Duration, maxPending int) *deliveryBuffer {
 	if gapTimeout <= 0 {
-		gapTimeout = 25 * time.Millisecond
+		gapTimeout = 100 * time.Millisecond
+	}
+	if maxPending <= 0 {
+		maxPending = 4096
 	}
 	return &deliveryBuffer{
 		next:       1, // seqs start at 1 (session.NextSeq)
 		pending:    make(map[uint32]*frame.Frame),
 		gapTimeout: gapTimeout,
+		maxPending: maxPending,
 	}
 }
 
@@ -56,6 +61,18 @@ func (d *deliveryBuffer) Push(frames []*frame.Frame) []*frame.Frame {
 			d.drainContiguous(&out)
 		} else {
 			if _, dup := d.pending[f.Seq]; !dup {
+				// BDP guard: a stalled path must not grow the buffer
+				// without bound. Drop the longest-waiting frame (the
+				// lowest seq) — it is furthest past its usefulness.
+				if len(d.pending) >= d.maxPending {
+					lo := f.Seq
+					for seq := range d.pending {
+						if int32(seq-lo) < 0 {
+							lo = seq
+						}
+					}
+					delete(d.pending, lo)
+				}
 				d.pending[f.Seq] = f
 			}
 			if d.gapSince.IsZero() {
