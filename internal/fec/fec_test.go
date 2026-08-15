@@ -72,6 +72,68 @@ func assertDelivered(t *testing.T, delivered []*frame.Frame, wantSeq []uint32) {
 	}
 }
 
+// TestTakeStreamStats: the decoder accounts unrecovered loss per stream —
+// data frames missing when a block flushes. Recovered blocks count zero.
+func TestTakeStreamStats(t *testing.T) {
+	params := Params{DataShards: 2, ParityShards: 1, BlockTimeout: 8 * time.Millisecond}
+	enc, err := NewEncoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := NewDecoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+
+	// Block 1: deliver data1 + parity (data2 lost on the wire) → RS
+	// reconstructs, so NOTHING is counted as lost.
+	f1 := &frame.Frame{SessionID: testSession, Seq: 1, Payload: []byte("a")}
+	f2 := &frame.Frame{SessionID: testSession, Seq: 2, Payload: []byte("bb")}
+	emitted := encodeAll(t, enc, []*frame.Frame{f1, f2}) // data1, data2, parity
+	var parity *frame.Frame
+	for _, f := range emitted {
+		if f.HasFlag(frame.FlagFECParity) {
+			parity = f
+		}
+	}
+	if parity == nil {
+		t.Fatal("no parity emitted")
+	}
+	delivered := dec.Push("path", f1)
+	delivered = append(delivered, dec.Push("path", parity)...)
+	if len(delivered) != 2 {
+		t.Fatalf("reconstruction must deliver both frames, got %d", len(delivered))
+	}
+	lost, received := dec.TakeStreamStats(testSession, "path")
+	if lost != 0 || received != 1 {
+		t.Fatalf("recovered block: want lost=0 received=1, got lost=%d received=%d", lost, received)
+	}
+
+	// Block 2: both data frames lost, only the parity arrives → nothing
+	// to reconstruct; flush at deadline counts 2 lost.
+	f3 := &frame.Frame{SessionID: testSession, Seq: 3, Payload: []byte("ccc")}
+	f4 := &frame.Frame{SessionID: testSession, Seq: 4, Payload: []byte("dddd")}
+	emitted = encodeAll(t, enc, []*frame.Frame{f3, f4})
+	parity = nil
+	for _, f := range emitted {
+		if f.HasFlag(frame.FlagFECParity) {
+			parity = f
+		}
+	}
+	if parity == nil {
+		t.Fatal("no parity emitted")
+	}
+	if out := dec.Push("path", parity); len(out) != 0 {
+		t.Fatalf("single parity shard must not deliver yet: %d", len(out))
+	}
+	dec.Tick(now.Add(100 * time.Millisecond)) // block deadline passes
+	lost, received = dec.TakeStreamStats(testSession, "path")
+	if lost != 2 || received != 0 {
+		t.Fatalf("lost block: want lost=2 received=0, got lost=%d received=%d", lost, received)
+	}
+}
+
 // findSeq returns the index of the frame with seq, or -1.
 func findSeq(frames []*frame.Frame, seq uint32) int {
 	for i, f := range frames {

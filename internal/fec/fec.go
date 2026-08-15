@@ -232,6 +232,16 @@ type blockState struct {
 	flushed  bool
 }
 
+// streamStat counts unrecovered loss per stream (session+path): data
+// frames that arrived (received) vs data frames missing when their block
+// was flushed (lost). lost/(received+lost) is the in-band loss rate the
+// health monitor consumes — it is exact, per-path, and reacts within one
+// block timeout, unlike keepalive probes.
+type streamStat struct {
+	lost     uint64
+	received uint64
+}
+
 // Decoder reassembles FEC blocks and emits data frames in seq order. Safe
 // for concurrent use (Push from the data loop, Tick from the tunnel's
 // ticker).
@@ -245,6 +255,8 @@ type Decoder struct {
 	// flushed on timeout) cannot create phantom blocks and duplicate
 	// delivery.
 	lastFlushed map[streamKey]uint32
+	// stats accumulates per-stream loss counters for TakeStreamStats.
+	stats map[streamKey]streamStat
 }
 
 // NewDecoder builds a decoder for the given params.
@@ -264,7 +276,7 @@ func NewDecoder(p Params) (*Decoder, error) {
 		}
 	}
 	return &Decoder{params: p, rs: rs, blocks: make(map[blockKey]*blockState),
-		lastFlushed: make(map[streamKey]uint32)}, nil
+		lastFlushed: make(map[streamKey]uint32), stats: make(map[streamKey]streamStat)}, nil
 }
 
 // Push accepts a data or parity frame of a stream (session+path) and returns
@@ -304,7 +316,12 @@ func (d *Decoder) Push(path string, f *frame.Frame) []*frame.Frame {
 		if len(st.data) == 0 && len(st.parity) == 0 {
 			st.deadline = time.Now().Add(d.params.BlockTimeout)
 		}
-		st.data[f.Seq] = f.Payload
+		if _, dup := st.data[f.Seq]; !dup {
+			st.data[f.Seq] = f.Payload
+			s := d.stats[streamKey{sessionID: f.SessionID, path: path}]
+			s.received++
+			d.stats[streamKey{sessionID: f.SessionID, path: path}] = s
+		}
 	}
 	return d.maybeDeliver(key, st)
 }
@@ -418,6 +435,16 @@ func (d *Decoder) flush(key blockKey, st *blockState) []*frame.Frame {
 	if key.blockSeq > d.lastFlushed[sk] {
 		d.lastFlushed[sk] = key.blockSeq
 	}
+	// In-band loss accounting: when the block's expected frames are known
+	// (a parity sub-header arrived), any missing data frame is an
+	// unrecovered loss on this path — the exact signal the health monitor
+	// needs. Short blocks without parity carry no expected frame list, so
+	// nothing can be attributed.
+	if len(st.seqs) > 0 && len(st.data) < len(st.seqs) {
+		s := d.stats[sk]
+		s.lost += uint64(len(st.seqs) - len(st.data))
+		d.stats[sk] = s
+	}
 	if len(st.seqs) == 0 {
 		// No parity ever arrived: emit whatever data we hold, sorted.
 		out := make([]*frame.Frame, 0, len(st.data))
@@ -458,4 +485,16 @@ func sortUint32(s []uint32) {
 			s[j], s[j-1] = s[j-1], s[j]
 		}
 	}
+}
+
+// TakeStreamStats returns and resets the in-band loss counters for one
+// stream (session, path). The caller (health tick loop) converts the
+// deltas into a loss-rate sample and feeds the path's monitor. A stream
+// with no observed traffic yields zeroes.
+func (d *Decoder) TakeStreamStats(sessionID uint64, path string) (lost, received uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s := d.stats[streamKey{sessionID: sessionID, path: path}]
+	d.stats[streamKey{sessionID: sessionID, path: path}] = streamStat{}
+	return s.lost, s.received
 }
