@@ -3,8 +3,9 @@
 FlexBraid is configured with a single YAML file, passed with `-c path.yaml`.
 Every setting has a sane default; you only need to write what differs.
 
-> **Status:** M2 (data path + FEC) implemented. Config parsing and validation
-> are live; `scheduler`, `health` and `queue` settings take effect as M3 lands
+> **Status:** M3 (multi-WAN scheduler + health) implemented. Config parsing,
+> data path, FEC, load balancing, circuit breaker and failover are live;
+> `queue` settings take effect as M4 lands
 > (see [Roadmap](DESIGN.md#14-roadmap)).
 
 ---

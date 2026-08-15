@@ -102,13 +102,15 @@ func TestValidateRejectsNoWANs(t *testing.T) {
 	}
 }
 
-func TestAffinityDefaultsToFlow(t *testing.T) {
+func TestAffinityDefaultsToPacket(t *testing.T) {
 	c, err := loadString(sample)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
-	if c.Scheduler.Affinity != AffinityFlow {
-		t.Errorf("affinity = %q, want flow", c.Scheduler.Affinity)
+	// Packet is the default: the primary inner payload is a single
+	// WireGuard flow, which flow-affinity would pin to one WAN.
+	if c.Scheduler.Affinity != AffinityPacket {
+		t.Errorf("affinity = %q, want packet", c.Scheduler.Affinity)
 	}
 	if c.MTU != 1420 {
 		t.Errorf("mtu = %d, want 1420", c.MTU)

@@ -1,15 +1,17 @@
-// Package tunnel wires the FlexBraid pipeline together for a single WAN
-// (M1). It implements the client and server roles that pass inner WireGuard
-// traffic through the encrypted frame channel.
+// Package tunnel wires the FlexBraid pipeline together. It implements the
+// client and server roles that pass inner WireGuard traffic through the
+// encrypted frame channel over one or more WANs.
 //
 // Topology (docs/DESIGN.md §3.1, co-located egress):
 //
-//	[WG client] ──► ingress socket ──► client: seal+send ──► (WAN) ──►
-//	    server: recv+open ──► egress socket ──► [WG peer]
+//	[WG client] ──► ingress socket ──► client: scheduler → per-WAN seal/send
+//	    ──► (WAN 1..N) ──► server: recv+open ──► egress socket ──► [WG peer]
 //
-// Multi-WAN scheduling, FEC and health monitoring land in M2/M3; the
-// interfaces here are already shaped for them (Transport per WAN, per-path
-// endpoints in session).
+// M3: the client schedules each inner datagram onto one of N WANs (per-WAN
+// FEC blocks), monitors every WAN with keepalive probes and a circuit
+// breaker, and reassembles the server → client stream in-order via the
+// delivery buffer. The server mirrors this per session: per-path health and
+// per-block endpoint selection.
 //
 // Lifecycle: Start() binds all sockets and returns init errors synchronously
 // (port busy, bad address); Run(ctx) then starts the goroutines and blocks.
@@ -19,6 +21,7 @@ package tunnel
 import (
 	"context"
 	"crypto/cipher"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"math"
@@ -31,17 +34,26 @@ import (
 	"github.com/ColinFL/flexbraid/internal/crypto"
 	"github.com/ColinFL/flexbraid/internal/fec"
 	"github.com/ColinFL/flexbraid/internal/frame"
+	"github.com/ColinFL/flexbraid/internal/health"
+	"github.com/ColinFL/flexbraid/internal/scheduler"
 	"github.com/ColinFL/flexbraid/internal/session"
 	"github.com/ColinFL/flexbraid/internal/transport"
 )
 
 const (
-	// handshakeInterval is how often the client (re)sends its FIRST frame.
-	// This doubles as a lightweight NAT keepalive and guarantees the server
-	// learns the session even if early packets are lost.
+	// handshakeInterval is how often the client (re)sends its FIRST frame on
+	// every WAN. This doubles as a lightweight NAT keepalive and guarantees
+	// the server learns every path even if early packets are lost.
 	handshakeInterval = 5 * time.Second
 	// recvBufSize is the max UDP datagram size we accept.
 	recvBufSize = 65535
+	// defaultProbeInterval is the keepalive probe period when
+	// health.probe_interval is unset.
+	defaultProbeInterval = time.Second
+	// defaultDegradeSec is the DEGRADED hysteresis window default.
+	defaultDegradeSec = 3 * time.Second
+	// maxWANs caps the number of WANs a client may configure.
+	maxWANs = 16
 )
 
 func resolveUDPAddr(s string) (*net.UDPAddr, error) {
@@ -52,6 +64,34 @@ func resolveUDPAddr(s string) (*net.UDPAddr, error) {
 	return addr, nil
 }
 
+// wanLink is the per-WAN state of the client: transport, per-WAN FEC codecs
+// (blocks never mix WANs), the health monitor and the keepalive probe state.
+type wanLink struct {
+	id     string
+	cfg    config.WAN
+	tr     transport.Transport
+	enc    *fec.Encoder // client → server
+	dec    *fec.Decoder // server → client
+	health *health.Monitor
+
+	// sendMu serializes batches on this WAN (P4): the ingress and FEC-tick
+	// loops cannot interleave frames of one block with another.
+	sendMu sync.Mutex
+
+	// framesSent counts data frames handed to this WAN's transport
+	// (telemetry + failover tests; keepalives excluded).
+	framesSent atomic.Uint64
+	// pongs / missedProbes count probe outcomes (telemetry + tests).
+	pongs        atomic.Uint64
+	missedProbes atomic.Uint64
+
+	// Keepalive probe state (keepaliveLoop + recvLoop).
+	probeMu    sync.Mutex
+	probeOut   bool          // previous probe unanswered?
+	probeRTT   time.Duration // RTT of the last answered probe
+	probeStart time.Time     // when the outstanding probe was sent
+}
+
 // Client is the FlexBraid tunnel client (office side).
 type Client struct {
 	cfg      *config.Config
@@ -59,19 +99,19 @@ type Client struct {
 	baseAEAD cipher.AEAD // handshake key (derived from PSK only)
 	sessAEAD cipher.AEAD // per-session key (derived from PSK + session ID)
 	sess     *session.Client
-	wanTr    transport.Transport
+	wans     []*wanLink
+	byWAN    map[string]*wanLink
+	sched    *scheduler.Scheduler
+	delivery *deliveryBuffer
 
-	fecEnc *fec.Encoder // client → server
-	fecDec *fec.Decoder // server → client
+	probeInterval time.Duration
 
-	// sendMu serializes batches of frames on the WAN transport so the
-	// ingress loop and the FEC tick loop cannot interleave frames and
-	// reorder them on the wire (P4).
-	sendMu sync.Mutex
 	// sendErrs throttles repeated send-failure logging (P6).
 	sendErrs atomic.Uint64
 	// oversizeErrs throttles MTU-exceeded logging (P6).
 	oversizeErrs atomic.Uint64
+	// noWANErrs throttles 'no usable WAN' logging.
+	noWANErrs atomic.Uint64
 
 	ingress *net.UDPConn // read-only after Start
 }
@@ -82,9 +122,10 @@ type Client struct {
 // (a lost fragment would defeat FEC entirely — design §6.6).
 const pathMTU = 1500
 
-// fecParamsFromConfig derives codec params from the config. A disabled or
-// off-mode FEC yields pass-through codecs (no buffering, no parity).
-func fecParamsFromConfig(cfg *config.Config) (fec.Params, error) {
+// fecParamsFor derives codec params for one WAN from the config, honouring a
+// per-WAN max_loss override. A disabled or off-mode FEC yields pass-through
+// codecs (no buffering, no parity).
+func fecParamsFor(cfg *config.Config, wan *config.WAN) (fec.Params, error) {
 	f := cfg.FEC
 	timeout := time.Duration(f.BlockTimeoutMS) * time.Millisecond
 	if !f.Enabled || f.Mode == config.FECOff {
@@ -101,6 +142,12 @@ func fecParamsFromConfig(cfg *config.Config) (fec.Params, error) {
 		parity = int(math.Ceil(float64(k) * f.FixedOverheadPct / 100.0))
 	case config.FECAdaptive:
 		l := f.MaxLossPct / 100.0
+		if wan != nil && wan.FECMaxLossPct != nil {
+			l = *wan.FECMaxLossPct / 100.0
+		}
+		if l <= 0 || l >= 1 {
+			return fec.Params{}, fmt.Errorf("invalid fec max_loss_pct %v (must be 0 < x < 100)", l*100)
+		}
 		parity = int(math.Ceil(float64(k) * l / (1 - l)))
 	default:
 		return fec.Params{}, fmt.Errorf("unknown fec.mode %q", f.Mode)
@@ -120,6 +167,49 @@ func fecParamsFromConfig(cfg *config.Config) (fec.Params, error) {
 	return params, nil
 }
 
+// fecCompensableLoss returns the loss fraction the configured FEC can repair
+// (0 when disabled) — the health monitor's degrade threshold.
+func fecCompensableLoss(p fec.Params) float64 {
+	if !p.Enabled() {
+		return 0.10 // no FEC: any sustained loss above 10% is non-compensable
+	}
+	return float64(p.ParityShards) / float64(p.DataShards+p.ParityShards)
+}
+
+// effectiveCapacity returns a path's scheduling weight for balance_by:
+// declared capacity, reduced by the per-path FEC overhead, or 1 for
+// round-robin.
+func effectiveCapacity(wan config.WAN, p fec.Params, balanceBy config.BalanceBy) float64 {
+	if balanceBy == config.BalanceByRoundRobin {
+		return 1
+	}
+	cap := float64(wan.CapacityMbps)
+	if cap <= 0 {
+		cap = 1 // unknown capacity: assume equal share
+	}
+	if balanceBy == config.BalanceByFEC && p.Enabled() {
+		overhead := float64(p.ParityShards) / float64(p.DataShards+p.ParityShards)
+		cap *= 1 - overhead
+	}
+	if wan.Weight > 0 {
+		cap *= wan.Weight
+	}
+	return cap
+}
+
+// healthOptions maps the config's health section onto monitor options.
+func healthOptions(h config.Health, maxLoss float64, probeInterval time.Duration) health.Options {
+	return health.Options{
+		MaxLoss:         maxLoss,
+		DegradeAfter:    time.Duration(h.DegradeSec * float64(time.Second)),
+		RecoverAfter:    time.Duration(h.RecoverMin * float64(time.Minute)),
+		LossAlphaFast:   h.LossAlphaFast,
+		LossAlphaSlow:   h.LossAlphaSlow,
+		JitterAlpha:     h.JitterAlpha,
+		DownAfterMisses: 3,
+	}
+}
+
 // NewClient builds a tunnel client from config.
 func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 	if err := cfg.Validate(); err != nil {
@@ -128,12 +218,16 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 	if len(cfg.WANs) == 0 {
 		return nil, fmt.Errorf("client requires at least one WAN")
 	}
-	if cfg.WANs[0].Transport != config.TransportUDP {
-		return nil, fmt.Errorf("M1 supports only udp transport, got %q (faketcp/icmp arrive in M4)", cfg.WANs[0].Transport)
+	if len(cfg.WANs) > maxWANs {
+		return nil, fmt.Errorf("too many WANs: %d (max %d)", len(cfg.WANs), maxWANs)
 	}
-	if len(cfg.WANs) > 1 {
-		log.Warn("M1 uses only the first WAN; multi-WAN scheduling arrives in M3",
-			"configured", len(cfg.WANs))
+	for i := range cfg.WANs {
+		if cfg.WANs[i].Transport != config.TransportUDP {
+			return nil, fmt.Errorf("M3 supports only udp transport, got %q (faketcp/icmp arrive in M4)", cfg.WANs[i].Transport)
+		}
+		if cfg.WANs[i].ID == "" {
+			return nil, fmt.Errorf("wan[%d].id is required", i)
+		}
 	}
 
 	baseKey, err := crypto.DeriveKey([]byte(cfg.Crypto.Key))
@@ -157,39 +251,75 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("session cipher: %w", err)
 	}
 
-	wan := cfg.WANs[0]
+	probeInterval := time.Duration(cfg.Health.ProbeInterval * float64(time.Second))
+	if probeInterval <= 0 {
+		probeInterval = defaultProbeInterval
+	}
 	c := &Client{
-		cfg:      cfg,
-		log:      log,
-		baseAEAD: baseAEAD,
-		sessAEAD: sessAEAD,
-		sess:     session.NewClientWithID(id),
-		wanTr:    transport.NewUDP(wan.ID, "", cfg.Server),
+		cfg:           cfg,
+		log:           log,
+		baseAEAD:      baseAEAD,
+		sessAEAD:      sessAEAD,
+		sess:          session.NewClientWithID(id),
+		byWAN:         make(map[string]*wanLink),
+		sched:         scheduler.New(schedulerOptions(cfg)),
+		probeInterval: probeInterval,
 	}
-	params, err := fecParamsFromConfig(cfg)
-	if err != nil {
-		return nil, err
+	// Per-WAN transports, FEC codecs and health monitors.
+	for i := range cfg.WANs {
+		wcfg := &cfg.WANs[i]
+		params, err := fecParamsFor(cfg, wcfg)
+		if err != nil {
+			return nil, err
+		}
+		enc, err := fec.NewEncoder(params)
+		if err != nil {
+			return nil, fmt.Errorf("wan %s fec encoder: %w", wcfg.ID, err)
+		}
+		dec, err := fec.NewDecoder(params)
+		if err != nil {
+			return nil, fmt.Errorf("wan %s fec decoder: %w", wcfg.ID, err)
+		}
+		mon := health.New(healthOptions(cfg.Health, fecCompensableLoss(params), probeInterval))
+		wan := &wanLink{
+			id:     wcfg.ID,
+			cfg:    *wcfg,
+			tr:     transport.NewUDP(wcfg.ID, "", cfg.Server),
+			enc:    enc,
+			dec:    dec,
+			health: mon,
+		}
+		c.wans = append(c.wans, wan)
+		c.byWAN[wcfg.ID] = wan
+		c.sched.AddPath(wcfg.ID, effectiveCapacity(*wcfg, params, cfg.Scheduler.BalanceBy))
+		log.Info("wan configured",
+			"wan", wcfg.ID,
+			"transport", wcfg.Transport,
+			"capacity_mbps", wcfg.CapacityMbps,
+			"fec", fecSummary(params))
 	}
-	c.fecEnc, err = fec.NewEncoder(params)
-	if err != nil {
-		return nil, fmt.Errorf("fec encoder: %w", err)
-	}
-	c.fecDec, err = fec.NewDecoder(params)
-	if err != nil {
-		return nil, fmt.Errorf("fec decoder: %w", err)
-	}
-	if params.Enabled() {
-		log.Info("fec enabled",
-			"data_shards", params.DataShards,
-			"parity_shards", params.ParityShards,
-			"block_timeout_ms", params.BlockTimeout.Milliseconds())
-	} else {
-		log.Info("fec disabled")
-	}
+	// Delivery buffer: gap timeout covers FEC block assembly + path skew.
+	gapTimeout := 2*time.Duration(cfg.FEC.BlockTimeoutMS)*time.Millisecond + 25*time.Millisecond
+	c.delivery = newDeliveryBuffer(gapTimeout)
 	return c, nil
 }
 
-// Start binds the ingress socket and opens the WAN transport. It must be
+func fecSummary(p fec.Params) string {
+	if !p.Enabled() {
+		return "off"
+	}
+	return fmt.Sprintf("k=%d parity=%d", p.DataShards, p.ParityShards)
+}
+
+func schedulerOptions(cfg *config.Config) scheduler.Options {
+	return scheduler.Options{
+		Mode:      string(cfg.Scheduler.Mode),
+		Affinity:  string(cfg.Scheduler.Affinity),
+		BalanceBy: string(cfg.Scheduler.BalanceBy),
+	}
+}
+
+// Start binds the ingress socket and opens all WAN transports. It must be
 // called before Run and returns init errors (e.g. port busy) synchronously.
 func (c *Client) Start() error {
 	ingressAddr, err := resolveUDPAddr(c.cfg.Listen)
@@ -202,9 +332,14 @@ func (c *Client) Start() error {
 	}
 	c.ingress = ingress
 
-	if err := c.wanTr.Open(); err != nil {
-		ingress.Close()
-		return err
+	for _, wan := range c.wans {
+		if err := wan.tr.Open(); err != nil {
+			ingress.Close()
+			for _, w := range c.wans {
+				w.tr.Close()
+			}
+			return fmt.Errorf("wan %s: %w", wan.id, err)
+		}
 	}
 	return nil
 }
@@ -213,28 +348,46 @@ func (c *Client) Start() error {
 // first.
 func (c *Client) Run(ctx context.Context) error {
 	defer c.ingress.Close()
-	defer c.wanTr.Close()
+	defer func() {
+		for _, wan := range c.wans {
+			wan.tr.Close()
+		}
+	}()
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// One handshake + keepalive + recv loop per WAN.
+	var recvWG sync.WaitGroup
+	for _, wan := range c.wans {
+		go c.handshakeLoop(ctx, wan)
+		go c.keepaliveLoop(ctx, wan)
+		recvWG.Add(1)
+		go func(w *wanLink) {
+			defer recvWG.Done()
+			c.recvLoop(w)
+		}(wan)
+	}
+	go c.fecTickLoop(ctx)
+	go c.healthTickLoop(ctx)
+
+	wans := make([]string, len(c.wans))
+	for i, wan := range c.wans {
+		wans[i] = wan.id
+	}
 	c.log.Info("client started",
 		"session", fmt.Sprintf("%016x", uint64(c.sess.ID)),
 		"ingress", c.cfg.Listen,
 		"server", c.cfg.Server,
-		"wan", c.wanTr.ID())
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go c.handshakeLoop(ctx)
-	go c.fecTickLoop(ctx)
-
-	recvDone := make(chan struct{})
-	go func() {
-		defer close(recvDone)
-		c.recvLoop()
-	}()
+		"wans", wans,
+		"scheduler", c.cfg.Scheduler.Mode,
+		"affinity", c.cfg.Scheduler.Affinity)
 
 	err := c.ingressLoop(ctx)
-	c.wanTr.Close() // unblocks recvLoop
-	<-recvDone
+	for _, wan := range c.wans {
+		wan.tr.Close() // unblock recvLoops
+	}
+	recvWG.Wait()
 	return err
 }
 
@@ -247,17 +400,22 @@ func (c *Client) LocalAddr() *net.UDPAddr {
 }
 
 // handshakeLoop sends the FIRST frame immediately and then every
-// handshakeInterval. FIRST frames are sealed with the *base* key — the
-// server has no session yet, so it cannot know the per-session key.
-func (c *Client) handshakeLoop(ctx context.Context) {
+// handshakeInterval, on one WAN. FIRST frames are sealed with the *base*
+// key — the server has no session yet, so it cannot know the per-session
+// key. The payload carries the WAN's declared capacity so the server can
+// weight its own per-path scheduling.
+func (c *Client) handshakeLoop(ctx context.Context, wan *wanLink) {
 	send := func() {
+		payload := make([]byte, 4)
+		binary.BigEndian.PutUint32(payload, uint32(wan.cfg.CapacityMbps))
 		f := &frame.Frame{
 			Flags:     frame.FlagFirst,
 			SessionID: uint64(c.sess.ID),
 			Seq:       c.sess.NextSeq(),
+			Payload:   payload,
 		}
-		if err := c.send(f, c.baseAEAD); err != nil {
-			c.log.Warn("handshake send failed", "error", err)
+		if err := c.send(wan, f, c.baseAEAD); err != nil {
+			c.log.Warn("handshake send failed", "wan", wan.id, "error", err)
 		}
 	}
 	send()
@@ -273,16 +431,76 @@ func (c *Client) handshakeLoop(ctx context.Context) {
 	}
 }
 
-// send seals and transmits one frame over the WAN transport. P4: sendMu is
-// held for the whole call so a handshake frame cannot interleave with a data
-// batch; batch sends (sendEncoded) hold it across all frames of a block.
-func (c *Client) send(f *frame.Frame, aead cipher.AEAD) error {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	return c.sendLocked(f, aead)
+// keepaliveLoop probes one WAN every probeInterval with a KEEPALIVE frame;
+// the server answers with a PONG carrying the same timestamp, giving the
+// client a per-WAN loss + RTT sample. Loss is measured per interval: at each
+// tick, the previous probe either was answered (loss 0) or not (loss 1).
+func (c *Client) keepaliveLoop(ctx context.Context, wan *wanLink) {
+	send := func() {
+		payload := make([]byte, 8)
+		binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixMilli()))
+		f := &frame.Frame{
+			Flags:     frame.FlagKeepalive,
+			SessionID: uint64(c.sess.ID),
+			Seq:       c.sess.NextSeq(),
+			Payload:   payload,
+		}
+		if err := c.send(wan, f, c.sessAEAD); err != nil {
+			c.log.Warn("keepalive send failed", "wan", wan.id, "error", err)
+		}
+		wan.probeMu.Lock()
+		wan.probeOut = true
+		wan.probeStart = time.Now()
+		wan.probeMu.Unlock()
+	}
+	send()
+	t := time.NewTicker(c.probeInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			wan.probeMu.Lock()
+			wasOut := wan.probeOut
+			rtt := wan.probeRTT
+			wan.probeMu.Unlock()
+			if wasOut {
+				wan.health.NoteMissedProbe()
+				wan.health.ObserveSample(1, 0)
+				wan.missedProbes.Add(1)
+			} else {
+				wan.health.ObserveSample(0, rtt)
+			}
+			send()
+		}
+	}
 }
 
-func (c *Client) sendLocked(f *frame.Frame, aead cipher.AEAD) error {
+// handlePong processes a PONG reply on one WAN: it echoes the probe's
+// timestamp, so RTT = now − ts. The loss sample is booked by the keepalive
+// loop at the next tick.
+func (c *Client) handlePong(wan *wanLink, f *frame.Frame) {
+	if len(f.Payload) != 8 {
+		return
+	}
+	ts := int64(binary.BigEndian.Uint64(f.Payload))
+	wan.probeMu.Lock()
+	wan.probeRTT = time.Since(time.UnixMilli(ts))
+	wan.probeOut = false
+	wan.probeMu.Unlock()
+	wan.pongs.Add(1)
+}
+
+// send seals and transmits one frame on a WAN. P4: the WAN's sendMu is held
+// for the whole call so a control frame cannot interleave with a data batch.
+func (c *Client) send(wan *wanLink, f *frame.Frame, aead cipher.AEAD) error {
+	wan.sendMu.Lock()
+	defer wan.sendMu.Unlock()
+	return c.sendLocked(wan, f, aead)
+}
+
+func (c *Client) sendLocked(wan *wanLink, f *frame.Frame, aead cipher.AEAD) error {
 	plain, err := f.Encode()
 	if err != nil {
 		return err
@@ -291,23 +509,22 @@ func (c *Client) sendLocked(f *frame.Frame, aead cipher.AEAD) error {
 	if err != nil {
 		return err
 	}
-	return c.wanTr.Send(sealed)
+	return wan.tr.Send(sealed)
 }
 
-// sendEncoded seals and transmits frames produced by the FEC encoder.
-// Data frames already carry their seq (assigned before Push, so the parity
-// sub-header records the true seqs); parity frames get a fresh seq here.
-// The whole block is sent under one hold of sendMu (P4): frames of one
-// block stay contiguous on the wire, and the ingress and FEC-tick loops
-// cannot interleave and reorder them.
-func (c *Client) sendEncoded(frames []*frame.Frame) {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
+// sendEncoded seals and transmits one FEC block on its WAN. Data frames
+// already carry their seq (assigned before Push, so the parity sub-header
+// records the true seqs); parity frames get a fresh seq here. The whole
+// block is sent under one hold of the WAN's sendMu (P4).
+func (c *Client) sendEncoded(wan *wanLink, frames []*frame.Frame) {
+	wan.sendMu.Lock()
+	defer wan.sendMu.Unlock()
 	for _, f := range frames {
 		if f.HasFlag(frame.FlagFECParity) {
 			f.Seq = c.sess.NextSeq()
 		}
-		if err := c.sendLocked(f, c.sessAEAD); err != nil {
+		wan.framesSent.Add(1)
+		if err := c.sendLocked(wan, f, c.sessAEAD); err != nil {
 			c.noteSendErr(err)
 		}
 	}
@@ -332,7 +549,16 @@ func (c *Client) noteOversize(n int) {
 	}
 }
 
-// ingressLoop relays inner datagrams (WireGuard) into the tunnel.
+// noteNoWAN logs frames dropped because every WAN is down, throttled.
+func (c *Client) noteNoWAN() {
+	n := c.noWANErrs.Add(1)
+	if n == 1 || n%1000 == 0 {
+		c.log.Warn("no usable WAN, dropping inner datagram", "count", n)
+	}
+}
+
+// ingressLoop relays inner datagrams (WireGuard) into the tunnel, picking a
+// WAN per datagram via the scheduler.
 func (c *Client) ingressLoop(ctx context.Context) error {
 	buf := make([]byte, recvBufSize)
 	for {
@@ -346,9 +572,9 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 		if c.sess.WGAddr() == nil {
 			c.sess.SetWGAddr(addr)
 		}
-		// Defense-in-depth: the config validation (fecParamsFromConfig)
-		// already bounds the MTU; drop anything that still exceeds it
-		// instead of letting an oversized frame hit the WAN.
+		// Defense-in-depth: the config validation (fecParamsFor) already
+		// bounds the MTU; drop anything that still exceeds it instead of
+		// letting an oversized frame hit the WAN.
 		if n > c.cfg.MTU {
 			c.noteOversize(n)
 			continue
@@ -360,14 +586,22 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 			Seq:       c.sess.NextSeq(), // before Push: sub-header records true seqs
 			Payload:   payload,
 		}
-		c.sendEncoded(c.fecEnc.Push(f))
+		wanID, ok := c.sched.Pick(f)
+		if !ok {
+			c.noteNoWAN()
+			continue
+		}
+		wan := c.byWAN[wanID]
+		c.sendEncoded(wan, wan.enc.Push(f))
 	}
 }
 
-// recvLoop relays tunneled replies back to the inner WireGuard peer.
-func (c *Client) recvLoop() {
+// recvLoop reads one WAN's sealed frames, verifies them, and routes them:
+// PONGs feed the health monitor, everything else goes through the WAN's FEC
+// decoder into the in-order delivery buffer.
+func (c *Client) recvLoop(wan *wanLink) {
 	for {
-		sealed, _, err := c.wanTr.Recv()
+		sealed, _, err := wan.tr.Recv()
 		if err != nil {
 			return // transport closed
 		}
@@ -375,11 +609,15 @@ func (c *Client) recvLoop() {
 		if !ok {
 			continue
 		}
-		// Control/keepalive frames carry no inner data; M3 uses them for RTT.
+		if f.HasFlag(frame.FlagPong) {
+			c.handlePong(wan, f)
+			continue
+		}
+		// Control/keepalive frames carry no inner data.
 		if f.HasFlag(frame.FlagControl) || f.HasFlag(frame.FlagKeepalive) || len(f.Payload) == 0 {
 			continue
 		}
-		c.deliverToWG(c.fecDec.Push(f))
+		c.deliverToWG(c.delivery.Push(wan.dec.Push(wan.id, f)))
 	}
 }
 
@@ -396,9 +634,10 @@ func (c *Client) deliverToWG(frames []*frame.Frame) {
 	}
 }
 
-// fecTickLoop flushes short FEC blocks on both directions.
+// fecTickLoop flushes short FEC blocks on every WAN (both directions) and
+// advances the delivery buffer's gap timer.
 func (c *Client) fecTickLoop(ctx context.Context) {
-	interval := c.fecEnc.Params().BlockTimeout / 2
+	interval := c.wans[0].enc.Params().BlockTimeout / 2
 	if interval < time.Millisecond {
 		interval = time.Millisecond
 	}
@@ -409,8 +648,35 @@ func (c *Client) fecTickLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			c.sendEncoded(c.fecEnc.Tick(now))
-			c.deliverToWG(c.fecDec.Tick(now))
+			for _, wan := range c.wans {
+				c.sendEncoded(wan, wan.enc.Tick(now))
+				c.deliverToWG(c.delivery.Push(wan.dec.Tick(now)))
+			}
+			c.deliverToWG(c.delivery.Tick(now))
+		}
+	}
+}
+
+// healthTickLoop advances every WAN's circuit breaker and pushes state
+// changes into the scheduler, which is what actually removes a bad path from
+// rotation (or restores it after recovery).
+func (c *Client) healthTickLoop(ctx context.Context) {
+	t := time.NewTicker(200 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			for _, wan := range c.wans {
+				before := wan.health.State()
+				wan.health.Tick(now)
+				after := wan.health.State()
+				if after != before {
+					c.log.Info("wan state changed", "wan", wan.id, "state", after.String())
+				}
+				c.sched.OnState(wan.id, after, wan.health.Loss())
+			}
 		}
 	}
 }

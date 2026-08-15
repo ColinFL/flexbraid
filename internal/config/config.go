@@ -154,10 +154,10 @@ type Health struct {
 	LossAlphaFast float64 `yaml:"loss_alpha_fast"` // fast-rise EWMA weight (reacts to spikes)
 	LossAlphaSlow float64 `yaml:"loss_alpha_slow"` // slow-decay EWMA weight (settles down)
 	JitterAlpha   float64 `yaml:"jitter_alpha"`
-	DegradeSec    int     `yaml:"degrade_sec"`    // sustained loss above cap -> DEGRADED
-	RecoverMin    int     `yaml:"recover_min"`    // stability window before a path is restored
-	ProbeInterval int     `yaml:"probe_interval"` // active keepalive period while DOWN
-	DownGraceSec  int     `yaml:"down_grace_sec"` // drain window before hard disable
+	DegradeSec    float64 `yaml:"degrade_sec"`    // sustained loss above cap -> DEGRADED (s)
+	RecoverMin    float64 `yaml:"recover_min"`    // stability window (min, fractional ok) before a path is restored
+	ProbeInterval float64 `yaml:"probe_interval"` // keepalive probe period (s); 0 -> 1s
+	DownGraceSec  float64 `yaml:"down_grace_sec"` // drain window before hard disable (s)
 }
 
 // Crypto configures the tunnel's encryption/auth.
@@ -233,7 +233,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid scheduler.mode %q: must be %q or %q", c.Scheduler.Mode, SchedulerLB, SchedulerStandby)
 	}
 	if c.Scheduler.Affinity == "" {
-		c.Scheduler.Affinity = AffinityFlow
+		// Packet is the default: the primary inner payload is a single
+		// WireGuard flow, which flow-affinity would pin to one WAN and
+		// defeat load balancing entirely. Flow affinity exists for many
+		// independent inner flows (e.g. OpenVPN).
+		c.Scheduler.Affinity = AffinityPacket
 	}
 	switch c.Scheduler.Affinity {
 	case AffinityFlow, AffinityPacket:

@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -164,8 +165,10 @@ func Open(aead cipher.AEAD, dir NonceDirection, sealed []byte) ([]byte, error) {
 // ReplayWindow is a sliding-window anti-replay filter (bitmap). It accepts a
 // seq exactly once and rejects older or replayed seqs. The window size must
 // be >= the delivery-buffer window so multi-path reordering is never treated
-// as a replay (design invariant).
+// as a replay (design invariant). It is concurrency-safe: since M3 every
+// WAN's receive loop shares the session's window.
 type ReplayWindow struct {
+	mu     sync.Mutex
 	window uint32
 	base   uint32 // seq mapped to bit 0
 	bits   []uint64
@@ -185,6 +188,8 @@ func NewReplayWindow(size uint32) *ReplayWindow {
 
 // CheckAndMark reports whether seq is new (not a replay) and marks it seen.
 func (w *ReplayWindow) CheckAndMark(seq uint32) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	diff := int64(seq) - int64(w.base)
 	switch {
 	case diff < 0:

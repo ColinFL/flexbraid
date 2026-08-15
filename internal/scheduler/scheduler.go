@@ -275,7 +275,7 @@ func parseInnerHash(payload []byte) (uint64, bool) {
 	base := uint64(binary.BigEndian.Uint32(payload[12:16]))<<32 |
 		uint64(binary.BigEndian.Uint32(payload[16:20]))
 	if (proto == 6 || proto == 17) && len(payload) >= ihl+4 {
-		base ^= uint64(binary.BigEndian.Uint16(payload[ihl : ihl+2])) << 16
+		base ^= uint64(binary.BigEndian.Uint16(payload[ihl:ihl+2])) << 16
 		base ^= uint64(binary.BigEndian.Uint16(payload[ihl+2 : ihl+4]))
 	}
 	return base, true

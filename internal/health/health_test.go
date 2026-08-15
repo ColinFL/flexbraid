@@ -84,6 +84,42 @@ func TestMissedProbesMarkDown(t *testing.T) {
 
 // TestRevivalRequiresStability: a DOWN path revives only after responses
 // resume AND loss stays low for RecoverAfter.
+func TestLossSamplesDoNotConsumeRevival(t *testing.T) {
+	m := New(Options{MaxLoss: 0.1, DegradeAfter: 300 * time.Millisecond})
+	now := time.Now()
+	// Path dies: 3 missed probes → DOWN. Loss samples interleave with
+	// NoteMissedProbe exactly as the keepalive loop does.
+	for i := 0; i < 3; i++ {
+		m.NoteMissedProbe()
+		m.ObserveSample(1, 0)
+	}
+	if m.State() != StateDown {
+		t.Fatalf("expected DOWN, got %v", m.State())
+	}
+	// More loss samples while down (the path is still dead): the estimate
+	// must rise toward 100%, and the revival flag must NOT be consumed.
+	for i := 0; i < 10; i++ {
+		m.NoteMissedProbe()
+		m.ObserveSample(1, 0)
+	}
+	if got := m.Loss(); got < 0.9 {
+		t.Fatalf("loss must be near 1.0 while down, got %v", got)
+	}
+	// Path revives: the first genuine response hard-resets the estimate…
+	m.ObserveSample(0, 5*time.Millisecond)
+	if got := m.Loss(); got != 0 {
+		t.Fatalf("revival must reset loss to 0, got %v", got)
+	}
+	// …and recovery completes after RecoverAfter of stability.
+	m.Tick(now)
+	m.Tick(now.Add(11 * time.Second))
+	if m.State() != StateHealthy {
+		t.Fatalf("expected HEALTHY after stability window, got %v", m.State())
+	}
+}
+
+// TestRevivalRequiresStability: a DOWN path revives only after responses
+// resume AND loss stays low for RecoverAfter.
 func TestRevivalRequiresStability(t *testing.T) {
 	m := New(fastOpts())
 	now := time.Now()

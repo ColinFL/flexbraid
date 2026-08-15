@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/ColinFL/flexbraid/internal/config"
 	"github.com/ColinFL/flexbraid/internal/fec"
 	"github.com/ColinFL/flexbraid/internal/frame"
+	"github.com/ColinFL/flexbraid/internal/health"
 	"github.com/ColinFL/flexbraid/internal/transport"
 )
 
@@ -144,7 +146,7 @@ func startTestPairWrapped(t *testing.T, psk string, fecCfg *config.FEC, wrap fun
 		t.Fatalf("new client: %v", err)
 	}
 	if wrap != nil {
-		cli.wanTr = wrap(cli.wanTr)
+		cli.wans[0].tr = wrap(cli.wans[0].tr)
 	}
 	if err := cli.Start(); err != nil {
 		t.Fatalf("client start: %v", err)
@@ -172,13 +174,16 @@ func waitFor(t *testing.T, what string, fn func() bool, timeout time.Duration) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// lossyTransport wraps a Transport and drops every Nth frame on Send once
-// enabled. It models a lossy WAN for end-to-end FEC tests. The wrapper must
-// be installed before the tunnel starts; loss is toggled atomically.
+// lossyTransport wraps a Transport and drops frames on Send once enabled: it
+// models a lossy WAN (dropEvery) or a fully dead WAN (killAll). The wrapper
+// must be installed before the tunnel starts; toggles are atomic. sends
+// counts every frame handed to Send.
 type lossyTransport struct {
 	inner     transport.Transport
 	dropEvery int
 	enabled   atomic.Bool
+	killAll   atomic.Bool
+	sends     atomic.Uint64
 	mu        sync.Mutex
 	count     int
 }
@@ -191,6 +196,10 @@ func (l *lossyTransport) Recv() ([]byte, net.Addr, error)      { return l.inner.
 func (l *lossyTransport) Close() error                         { return l.inner.Close() }
 
 func (l *lossyTransport) Send(b []byte) error {
+	l.sends.Add(1)
+	if l.killAll.Load() {
+		return nil // the WAN is dead: every frame is swallowed
+	}
 	if !l.enabled.Load() {
 		return l.inner.Send(b)
 	}
@@ -446,6 +455,199 @@ func TestMTUValidationRejectsOversizedInnerMTU(t *testing.T) {
 	if _, err := NewClient(base(1390), testLogger()); err != nil {
 		t.Fatalf("MTU 1390 with FEC must be accepted: %v", err)
 	}
+}
+
+// startMultiWAN spins up a server + N-WAN client pair. Every client WAN
+// transport is wrapped in a killable lossyTransport (returned) so tests can
+// simulate a dead uplink.
+func startMultiWAN(t *testing.T, psk string, nWans int, healthCfg config.Health) (srv *Server, cli *Client, fakeWG, wgClient *net.UDPConn, killable []*lossyTransport) {
+	t.Helper()
+	log := testLogger()
+
+	fakeWG, err := net.ListenUDP("udp", mustUDPAddr(t, "127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("fake wg listen: %v", err)
+	}
+	t.Cleanup(func() { fakeWG.Close() })
+
+	srvCfg := &config.Config{
+		Mode:   config.ModeServer,
+		Listen: "127.0.0.1:0",
+		WGPeer: fakeWG.LocalAddr().String(),
+		Crypto: config.Crypto{Key: psk, Cipher: "chacha20poly1305"},
+		Health: healthCfg,
+	}
+	srv, err = NewServer(srvCfg, log)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Run(ctx) }()
+
+	cliCfg := &config.Config{
+		Mode:   config.ModeClient,
+		Listen: "127.0.0.1:0",
+		Server: srv.LocalAddr().String(),
+		Crypto: config.Crypto{Key: psk, Cipher: "chacha20poly1305"},
+		Health: healthCfg,
+		Scheduler: config.Sched{
+			Mode:      config.SchedulerLB,
+			BalanceBy: config.BalanceByCapacity,
+			Affinity:  config.AffinityPacket,
+		},
+	}
+	for i := 1; i <= nWans; i++ {
+		cliCfg.WANs = append(cliCfg.WANs, config.WAN{
+			ID: fmt.Sprintf("w%d", i), Transport: config.TransportUDP, CapacityMbps: 100,
+		})
+	}
+	cli, err = NewClient(cliCfg, log)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	for _, wan := range cli.wans {
+		kw := &lossyTransport{}
+		kw.inner = wan.tr
+		wan.tr = kw
+		killable = append(killable, kw)
+	}
+	if err := cli.Start(); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	go func() { _ = cli.Run(ctx) }()
+
+	wgClient, err = net.ListenUDP("udp", mustUDPAddr(t, "127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("wg client listen: %v", err)
+	}
+	t.Cleanup(func() { wgClient.Close() })
+	return srv, cli, fakeWG, wgClient, killable
+}
+
+// TestMultiWANLoadBalances verifies that with two WANs of equal capacity the
+// client scheduler spreads traffic over both (packet affinity), and every
+// inner datagram still reaches the WG peer.
+func TestMultiWANLoadBalances(t *testing.T) {
+	srv, cli, fakeWG, wgClient, killable := startMultiWAN(t, "mwan-psk", 2, config.Health{})
+	waitFor(t, "server session", func() bool { return srv.mgr.Count() == 1 }, 3*time.Second)
+
+	// Warm-up round trip so the tunnel is fully established.
+	sendUntilReceived(t, wgClient, cli.LocalAddr(), fakeWG, []byte("warmup"), 6*time.Second)
+
+	// Burst: keep resending each unique ping until all 60 arrive (UDP is
+	// lossy; the counters below reflect the scheduler's picks regardless).
+	const n = 60
+	sent := make(map[string]bool)
+	got := make(map[string]bool)
+	buf := make([]byte, 65535)
+	deadline := time.Now().Add(8 * time.Second)
+	for len(got) < n && time.Now().Before(deadline) {
+		for i := 0; i < n; i++ {
+			p := fmt.Sprintf("p%02d", i)
+			if !got[p] && !sent[p] {
+				if _, err := wgClient.WriteToUDP([]byte(p), cli.LocalAddr()); err == nil {
+					sent[p] = true
+				}
+			}
+		}
+		_ = fakeWG.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if nn, _, err := fakeWG.ReadFromUDP(buf); err == nil {
+			got[string(buf[:nn])] = true
+		}
+	}
+	if len(got) != n {
+		t.Fatalf("only %d/%d pings arrived", len(got), n)
+	}
+	s0, s1 := killable[0].sends.Load(), killable[1].sends.Load()
+	if s0 == 0 || s1 == 0 {
+		t.Fatalf("one WAN carried no traffic: w1=%d w2=%d", s0, s1)
+	}
+	total := s0 + s1
+	for i, kw := range killable {
+		if share := float64(kw.sends.Load()) / float64(total); share < 0.2 {
+			t.Fatalf("wan%d share %.0f%% — load balancing broken", i+1, share*100)
+		}
+	}
+}
+
+// TestMultiWANFailover verifies the circuit breaker end-to-end: killing one
+// WAN must (a) keep traffic flowing on the survivor, (b) remove the dead WAN
+// from rotation once its health trips, and (c) restore it after recovery.
+func TestMultiWANFailover(t *testing.T) {
+	// Probe every 100ms; degrade after 0.3s of non-compensable loss;
+	// restore a revived path after 3s of stability (recover_min is in
+	// minutes, so 0.05 ≈ 3s).
+	hc := config.Health{ProbeInterval: 0.1, DegradeSec: 0.3, RecoverMin: 0.05}
+	srv, cli, fakeWG, wgClient, killable := startMultiWAN(t, "failover-psk", 2, hc)
+	waitFor(t, "server session", func() bool { return srv.mgr.Count() == 1 }, 3*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Pinger: keeps inner traffic flowing for the whole test.
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if _, err := wgClient.WriteToUDP([]byte("ping"), cli.LocalAddr()); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	// Collector: counts arrivals at the WG peer.
+	var arrived atomic.Int64
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			_ = fakeWG.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			if _, _, err := fakeWG.ReadFromUDP(buf); err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				continue
+			}
+			arrived.Add(1)
+		}
+	}()
+
+	// (0) both WANs must be carrying data before the kill.
+	waitFor(t, "both WANs in use", func() bool {
+		return cli.byWAN["w1"].framesSent.Load() > 5 && cli.byWAN["w2"].framesSent.Load() > 5
+	}, 8*time.Second)
+
+	// (1) kill WAN2: arrivals must continue in every 500ms window (the
+	// surviving WAN carries on).
+	killable[1].killAll.Store(true)
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		before := arrived.Load()
+		time.Sleep(500 * time.Millisecond)
+		if arrived.Load() == before {
+			t.Fatal("no traffic arrived after WAN2 died")
+		}
+	}
+
+	// (2) the breaker trips: WAN2 goes DOWN and leaves rotation (its data
+	// frame counter freezes; keepalive probes still flow, by design).
+	waitFor(t, "wan2 DOWN", func() bool { return cli.byWAN["w2"].health.State() == health.StateDown }, 5*time.Second)
+	frozen := cli.byWAN["w2"].framesSent.Load()
+	time.Sleep(1200 * time.Millisecond)
+	if cli.byWAN["w2"].framesSent.Load() != frozen {
+		t.Fatalf("wan2 still scheduled after DOWN (frames %d → %d)", frozen, cli.byWAN["w2"].framesSent.Load())
+	}
+
+	// (3) revive: after the stability window the path returns to rotation.
+	killable[1].killAll.Store(false)
+	waitFor(t, "wan2 restored", func() bool { return cli.byWAN["w2"].framesSent.Load() > frozen }, 30*time.Second)
 }
 
 // TestParityFrameFitsPathMTU pins the P2 MTU math: the largest frame on the

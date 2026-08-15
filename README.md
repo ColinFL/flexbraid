@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/FreeBSD-OPNsense-blue.svg)](#)
 [![Platforms](https://img.shields.io/badge/Linux-Debian-orange.svg)](#)
-![Status](https://img.shields.io/badge/Status-M2%20FEC-blue.svg)
+![Status](https://img.shields.io/badge/Status-M3%20multi--WAN-blue.svg)
 
 *Many WANs. One connection. No dropped sessions.*
 

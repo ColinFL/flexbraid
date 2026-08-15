@@ -54,7 +54,7 @@ func decodeAll(t *testing.T, dec *Decoder, emitted []*frame.Frame) []*frame.Fram
 	t.Helper()
 	var delivered []*frame.Frame
 	for _, f := range emitted {
-		delivered = append(delivered, dec.Push(f)...)
+		delivered = append(delivered, dec.Push("test", f)...)
 	}
 	delivered = append(delivered, dec.Tick(time.Now().Add(100*time.Millisecond))...)
 	return delivered
@@ -239,7 +239,7 @@ func TestDisabledParamsPassThrough(t *testing.T) {
 	if len(out) != 1 || out[0] != f {
 		t.Fatal("disabled encoder must pass the frame straight through")
 	}
-	got := dec.Push(f)
+	got := dec.Push("test", f)
 	if len(got) != 1 || got[0] != f {
 		t.Fatal("disabled decoder must pass the frame straight through")
 	}

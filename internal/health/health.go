@@ -127,10 +127,11 @@ func New(opts Options) *Monitor {
 }
 
 // ObserveSample records one probe outcome: loss is 0 (answered) or 1
-// (missed). A positive rtt updates the RTT/jitter estimates. A response also
-// resets the missed-probe counter, and a path that was DOWN is hard-reset
-// (the new reality replaces the stale history — otherwise the slow-decay
-// EWMA would keep a revived path in DOWN for a long time).
+// (missed). A positive rtt updates the RTT/jitter estimates. Only a genuine
+// response (rtt > 0) resets the missed-probe counter and hard-resets a DOWN
+// path — a loss sample must NOT consume the revival flag, or the path would
+// come back with a stale ~100% loss estimate and never recover (the slow
+// decay would take minutes to cross the recovery threshold).
 func (m *Monitor) ObserveSample(loss float64, rtt time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -151,16 +152,17 @@ func (m *Monitor) ObserveSample(loss float64, rtt time.Duration) {
 			m.rtt += time.Duration(m.jitterAlpha * float64(rtt-m.rtt))
 		}
 		m.jitter += time.Duration(m.jitterAlpha * float64(delta-m.jitter))
-	}
-	m.misses = 0
-	if m.state == StateDown && !m.revived {
-		// Hard reset on first response after DOWN: the link is back,
-		// forget its dead past. Subsequent responses must NOT reset the
-		// recovery timer (revived stays true), or the path would never
-		// leave DOWN in steady state.
-		m.revived = true
-		m.loss = 0
-		m.condSince = time.Time{}
+		// A response: the path is alive again.
+		m.misses = 0
+		if m.state == StateDown && !m.revived {
+			// Hard reset on the first response after DOWN: the link is
+			// back, forget its dead past. Subsequent responses must NOT
+			// reset the recovery timer (revived stays true), or the path
+			// would never leave DOWN in steady state.
+			m.revived = true
+			m.loss = 0
+			m.condSince = time.Time{}
+		}
 	}
 }
 
