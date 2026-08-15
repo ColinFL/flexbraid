@@ -343,21 +343,27 @@ blocks to the chosen WAN's encoder.
 
 ### 7.5 Graceful drain
 Before a degraded WAN is disabled, stop scheduling new flows onto it and let
-in-flight frames drain (`health.down_grace_sec`). Reduces loss versus an abrupt
-cut.
+in-flight frames drain. Reduces loss versus an abrupt cut. In `lb` mode a
+DEGRADED path keeps a token weight (0.2) so in-flight work finishes; in
+`standby` mode the scheduler switches to the next HEALTHY path immediately.
+`health.down_grace_sec` additionally debounces the DOWN transition itself
+(anti-flap), so a flapping link does not slam the scheduler between states.
 
-### 7.6 Queueing & backpressure
-WireGuard has no congestion control, so FlexBraid owns the queue discipline:
+### 7.6 Queueing & backpressure (deferred to M5)
+WireGuard has no congestion control, so FlexBraid will eventually own the
+queue discipline:
 - **Bounded per-WAN send queue**, sized to a latency budget (BDP-aware), never
   unbounded.
 - **Rate limiter** per WAN at its declared `capacity_mbps` (token bucket) so a
-  fast WAN cannot bufferbloat a slow one; scheduling weights are relative to
-  declared capacity.
-- **Drop policy on overflow:** `drop-oldest` for TCP-ish flows (loss is how TCP
-  learns to back off), `drop-newest` for real-time UDP (games want the latest
-  state). Configurable.
+  fast WAN cannot bufferbloat a slow one.
+- **Drop policy on overflow:** `drop-oldest` for TCP-ish flows, `drop-newest`
+  for real-time UDP (games want the latest state).
 - **No full backpressure to the ingress:** WG/UDP cannot be throttled upstream,
   so backpressure would only add latency, not remove load.
+
+The M3.1 config surface intentionally does **not** expose these knobs yet —
+the delivery buffer's `max_pending` bound (§5) provides the memory guard in
+the meantime. Scheduled for M5.
 
 ---
 
@@ -472,10 +478,13 @@ so new wire formats are drop-in.
   legitimate frames that multi-path delivery reordered. Frames are
   **authenticated before** the replay window is touched, so an unauthenticated
   attacker cannot poison it (window poisoning would be a permanent DoS).
-- **`crypto.integrity_only` (optional):** because WireGuard already encrypts the
-  inner data, this mode authenticates the plaintext with a Poly1305 MAC instead
-  of full AEAD — same integrity, less CPU on high-throughput links.
-  Default: full AEAD.
+  Handshakes (`FIRST`) additionally pass a per-ID replay window *before* any
+  session state is created, so a replay loop cannot grow the session table
+  (socket/memory DoS).
+- **No integrity-only mode:** the M3.1 config surface removed
+  `crypto.integrity_only` — the tunnel always uses full AEAD. WireGuard
+  already encrypts the inner data, but the tunnel's own headers still need
+  authenticated integrity; the CPU saving of MAC-only was negligible.
 - **Note:** inner traffic is additionally encrypted by WireGuard, but the
   tunnel layer must still authenticate/integrity-protect to stop an attacker
   from injecting frames into the tunnel.
@@ -504,11 +513,14 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
   `fec.max_loss_pct`, `fec.block_timeout_ms` — per-link FEC; can be disabled
   entirely.
 - `scheduler.mode` (`lb`/`standby`), `scheduler.affinity` (`flow`/`packet`),
-  `scheduler.balance_by` (`capacity`/`fec`/`roundrobin`).
-- `scheduler.queue` — per-WAN queue size, rate limit, drop policy (§7.6).
-- `mtu` — inner MTU advertised to WireGuard (§6.6).
-- `health.*` — EWMA weights, `degrade_sec`, `recover_min`, `probe_interval`.
-- `crypto.cipher`, `crypto.key`, `crypto.integrity_only`.
+  `scheduler.balance_by` (`capacity`/`fec`/`roundrobin`),
+  `scheduler.capacity_cap_mbps` (server-side clamp on declared capacity).
+- `wans[].iface` / `wans[].local_ip` — per-WAN socket binding (§12).
+- `delivery.gap_timeout_ms`, `delivery.max_pending` — reorder window (§5).
+- `fec.data_shards` — RS block size (games: 4–6).
+- `health.*` — EWMA weights, `degrade_sec`, `down_after_misses`,
+  `down_grace_sec`, `recover_min`, `probe_interval`.
+- `crypto.cipher`, `crypto.key`.
 
 ---
 
@@ -522,12 +534,14 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
 - **M2 — FEC** *(done, M2):* per-WAN RS encoder/decoder (self-describing
   parity), `adaptive`/`fixed`/`off`, short-block flush; verified end-to-end
   against 25% frame loss.
-- **M3 — Scheduler + health:** `lb` (flow-affine, capacity-weighted) and
-  `standby` modes, EWMA monitoring, circuit breaker, graceful drain,
-  delivery buffer (reorder+jitter), per-WAN queues/rate-limit.
-- **M4 — Multi-WAN resilience:** per-path endpoints (`session_id`), warm
-  standby failover, `affinity: packet` + cross-path FEC (optional),
-  FakeTCP + ICMP transports.
+- **M3 — Scheduler + health** *(done)*: `lb` (packet-affine, capacity-weighted)
+  and `standby` modes (standby abandons DEGRADED paths, not just dead ones),
+  EWMA monitoring, circuit breaker with in-band loss telemetry + silence
+  watchdog, delivery buffer (reorder+jitter, configurable window), per-WAN
+  socket binding (`iface`/`local_ip`). Per-WAN queues/rate-limit moved to M5.
+- **M4 — Multi-WAN resilience:** warm standby failover, cross-path FEC
+  (optional), FakeTCP + ICMP transports, adaptive FEC (live redundancy
+  adjustment from measured loss).
 - **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging, docs
   site, authenticated key-exchange (forward secrecy).
 

@@ -91,10 +91,14 @@ replies back on the path they came from (§9.1 of the design).
   answers each path independently. The inner layer never observes any of this.
 
 ### Keepalive
-When idle, each side sends a `KEEPALIVE` frame. It carries a timestamp in the
-payload, echoed back in the reply, giving the health monitor its RTT sample and
-liveness signal. Frequency: `health.probe_interval` while a path is DOWN,
-otherwise adaptive to traffic.
+Each side sends a `KEEPALIVE` frame every `health.probe_interval` on every
+path (M3.1: probes default to 1s — they are the secondary loss signal; the
+primary is in-band unrecovered-loss telemetry from the FEC decoder, which
+needs no probes at all). The payload carries a timestamp echoed back in the
+reply, giving the health monitor its RTT sample. A probe counts as missed
+only while the path is otherwise silent (no data frames arrived either), so
+probe jitter on a busy path cannot false-trip the circuit breaker. Total
+silence is caught by the watchdog in the health tick loop.
 
 ---
 
@@ -173,10 +177,11 @@ messages; wire numbering is reserved here and documented there.
   updated. An unauthenticated attacker therefore cannot slide the replay
   window (window poisoning → permanent DoS) nor grow the session table
   (memory DoS).
-- **Authentication / integrity:** the AEAD tag (or the Poly1305 MAC in
-  `crypto.integrity_only` mode) authenticates header + payload, including
-  `session_id`, so a forged/hijacked session cannot inject frames without the
-  key.
+- **Authentication / integrity:** the AEAD tag authenticates header + payload,
+  including `session_id`, so a forged/hijacked session cannot inject frames
+  without the key. (There is no integrity-only mode — removed in M3.1; the
+  CPU saving was negligible and the tunnel's own headers need authentication
+  regardless of WireGuard's inner encryption.)
 - **Anti-replay:** a sliding-window replay filter rejects replayed `seq`s. The
   window is sized **≥ the delivery-buffer window** (design §5) so it never
   drops legitimate frames that multi-path delivery reordered.

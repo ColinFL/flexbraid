@@ -81,8 +81,8 @@ fec:
   mode: adaptive
   max_loss_pct: 20
 wans:
-  - { id: w1, transport: faketcp, capacity_mbps: 300 }
-  - { id: w2, transport: udp,     capacity_mbps: 100 }
+  - { id: w1, transport: udp, capacity_mbps: 300 }
+  - { id: w2, transport: udp, capacity_mbps: 100 }
 ```
 
 Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
@@ -123,7 +123,10 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
   self-describing parity, adaptive/fixed/off modes, short-block flush),
   end-to-end loss recovery tests (25% frame loss → zero loss of inner
   datagrams).
-- **M3 — Scheduler + health:** `lb`/`standby`, EWMA monitor, circuit breaker.
+- **M3 — Scheduler + health** *(done)*: `lb`/`standby` (standby honours the
+  DEGRADED state — it abandons a path whose loss exceeds FEC capacity, not
+  just a dead one), per-WAN socket binding (`iface`/`local_ip`), EWMA monitor,
+  circuit breaker with in-band loss telemetry and a silence watchdog.
 - **M4 — Resilience:** endpoint migration, warm failover, FakeTCP/ICMP,
   cross-path FEC.
 - **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging.

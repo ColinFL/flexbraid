@@ -15,28 +15,30 @@ mtu: 1390               # inner MTU. With FEC on: 1500 − 44 (frame+tag) − 66
 # --- scheduler -----------------------------------------------------------
 scheduler:
   mode: lb              # "lb" (active load balance) | "standby" (warm standby)
-  affinity: flow        # "flow" (per-connection, default) | "packet" (per-frame)
+  affinity: packet      # "packet" (per-frame, default) | "flow" (per-connection)
   balance_by: capacity  # lb only: "capacity" | "fec" | "roundrobin"
-  queue:
-    max_pkts: 1024      # bounded per-WAN send queue (BDP-aware)
-    rate_limit_mbps: 0  # 0 = use each WAN's capacity_mbps
-    drop: drop-oldest   # on overflow: "drop-oldest" (TCP) | "drop-newest" (games)
+  capacity_cap_mbps: 0  # (server only) clamp on the capacity a client may
+                        # declare; 0 = trust the client (not recommended)
 
 # --- forward error correction (can be fully disabled) --------------------
 fec:
   enabled: true
   mode: adaptive        # "adaptive" | "fixed" | "off" | "crosspath"(M4)
                         # NOTE: adaptive computes redundancy once from
-                        # max_loss_pct (M2); live adaptation is TODO(M3).
+                        # max_loss_pct; live adaptation is TODO(M4).
+  data_shards: 10       # data frames per RS block (games: 4–6, see docs)
   max_loss_pct: 20      # compensable random-loss % per path (0–90)
-  block_timeout_ms: 8   # block collection window; adds latency
+  block_timeout_ms: 8   # block collection window; adds latency (games: 10–15)
   fixed_overhead_pct: 25  # used only when mode: fixed
 
 # --- WANs: one entry per physical uplink (any number) --------------------
 wans:
   - id: w1
-    transport: udp     # "udp" (M1) | "faketcp" | "icmp" (M4)
-    iface: igc1         # bind device (optional)
+    transport: udp     # "udp" (M3) | "faketcp" | "icmp" (M4)
+    iface: igc1         # bind device (SO_BINDTODEVICE / IP_BOUND_IF).
+                        # Requires root/CAP_NET_RAW; falls back to local_ip.
+    local_ip: ""        # bind source address instead (no privileges; needs
+                        # the IP on the box + OS policy routing)
     capacity_mbps: 300  # declared bandwidth → drives capacity-weighted balancing
     weight: 1.0
     # fec_max_loss_pct: 20   # optional per-path FEC override
@@ -44,8 +46,16 @@ wans:
   - id: w2
     transport: udp
     iface: igc0
+    local_ip: ""
     capacity_mbps: 100
     weight: 1.0
+
+# --- delivery: in-order reassembly window (client side) ------------------
+delivery:
+  gap_timeout_ms: 100   # max head-of-line blocking when a frame is missing.
+                        # Must cover the RTT skew between paths (cable+LTE
+                        # mixes routinely need 100ms+).
+  max_pending: 4096     # reorder-buffer bound (BDP guard; drop-oldest)
 
 # --- health: monitoring & circuit breaker --------------------------------
 health:
@@ -53,15 +63,16 @@ health:
   loss_alpha_slow: 0.03  # slow-decay EWMA weight (settles slowly)
   jitter_alpha: 0.1
   degrade_sec: 3         # sustained loss above FEC cap → DEGRADED
-  down_grace_sec: 1      # drain window before hard disable
+  down_after_misses: 3   # consecutive unanswered probes → DOWN
+  down_grace_sec: 1      # debounce before DOWN (anti-flap); 0 = immediate
   recover_min: 2         # stability window before a path is restored
-  probe_interval: 5      # active keepalive period while DOWN
+  probe_interval: 1      # keepalive probe period (s). Loss is ALSO measured
+                         # in-band from real traffic (no probe latency).
 
 # --- crypto --------------------------------------------------------------
 crypto:
   key: "change-me"            # shared PSK (required); AEAD keys derived from it
   cipher: chacha20poly1305    # "chacha20poly1305" | "aes256gcm"
-  integrity_only: false       # true = Poly1305 MAC only (WG already encrypts inner data)
 
 # --- logging -------------------------------------------------------------
 log:
