@@ -52,10 +52,14 @@ jobs:
           # (124) — crashing at startup is a regression.
           sed -E '/^[[:space:]]+(iface|local_ip):/d' config.example.yaml > /tmp/smoke-config.yaml
           ./dist/flexbraid-linux-amd64 -version
-          timeout 2 ./dist/flexbraid-linux-amd64 -c /tmp/smoke-config.yaml >/dev/null 2>&1
+          set +e
+          timeout 2 ./dist/flexbraid-linux-amd64 -c /tmp/smoke-config.yaml > /tmp/smoke.log 2>&1
           rc=$?
+          set -e
+          echo "smoke rc=$rc (want 124)"
           if [ "$rc" -ne 124 ]; then
-            echo "config.example.yaml must start the client and keep running (expected timeout exit 124, got $rc)"
+            echo "=== client log ==="
+            cat /tmp/smoke.log
             exit 1
           fi
 
