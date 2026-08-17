@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build · vet · race · cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race)
+        run: go test -race ./...
+
+      - name: cross-compile (linux / freebsd / windows)
+        run: |
+          GOOS=linux   GOARCH=amd64 go build ./...
+          GOOS=freebsd GOARCH=amd64 go build ./...
+          GOOS=windows GOARCH=amd64 go build ./...
+
+      - name: build dist binaries
+        run: make cross
+
+      - name: config smoke test
+        run: |
+          # The shipped example binds sockets to igc1/igc0 (OPNsense
+          # names); strip device/source binding so the client can start
+          # on a bare runner. It must keep running until the timeout
+          # (124) — crashing at startup is a regression.
+          sed -E '/^[[:space:]]+(iface|local_ip):/d' config.example.yaml > /tmp/smoke-config.yaml
+          ./dist/flexbraid-linux-amd64 -version
+          timeout 2 ./dist/flexbraid-linux-amd64 -c /tmp/smoke-config.yaml >/dev/null 2>&1
+          rc=$?
+          if [ "$rc" -ne 124 ]; then
+            echo "config.example.yaml must start the client and keep running (expected timeout exit 124, got $rc)"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flexbraid-binaries
+          path: dist/
+
+  windows:
+    name: test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test
+        run: go test ./...

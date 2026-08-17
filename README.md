@@ -1,6 +1,10 @@
 <div align="center">
 
-# 🧵 FlexBraid
+# FlexBraid
+
+[![CI](https://github.com/ColinFL/flexbraid/actions/workflows/ci.yml/badge.svg)](https://github.com/ColinFL/flexbraid/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Flexible multi-WAN bonding tunnel — weave several uplinks into one unbreakable connection.**
 
