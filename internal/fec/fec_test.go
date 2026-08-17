@@ -1,6 +1,7 @@
 package fec
 
 import (
+	"math"
 	"math/rand"
 	"testing"
 	"time"
@@ -104,6 +105,158 @@ func TestMixedFECModes(t *testing.T) {
 	df := &frame.Frame{SessionID: 1, Seq: 9, BlockSeq: 2, Payload: []byte("data")}
 	if got := dec2.Push("w1", df); len(got) != 1 {
 		t.Fatalf("pass-through decoder must deliver data frames, got %d", len(got))
+	}
+}
+
+// TestAdaptivePassThroughWhenClean: with no loss the adaptive encoder must
+// not code at all — frames pass through immediately with block_seq=0.
+func TestAdaptivePassThroughWhenClean(t *testing.T) {
+	enc, err := NewEncoder(adaptiveTestParams(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &frame.Frame{SessionID: testSession, Seq: 1, Payload: []byte("x")}
+	out := enc.Push(f)
+	if len(out) != 1 || out[0] != f {
+		t.Fatalf("clean link: frame must pass through immediately")
+	}
+	if f.BlockSeq != 0 {
+		t.Fatalf("pass-through frame must carry block_seq=0, got %d", f.BlockSeq)
+	}
+}
+
+// TestAdaptiveCodingOnLoss: when the measured loss crosses the on-threshold
+// the encoder starts coding: blocks fill to k and parity frames fly.
+func TestAdaptiveCodingOnLoss(t *testing.T) {
+	enc, err := NewEncoder(adaptiveTestParams(0.05)) // 5% loss → coding
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc.SetLossRate(0.05)
+
+	var out []*frame.Frame
+	for i := 1; i <= 4; i++ { // k=4
+		f := &frame.Frame{SessionID: testSession, Seq: uint32(i), Payload: []byte{byte(i)}}
+		out = append(out, enc.Push(f)...)
+	}
+	if len(out) < 4 {
+		t.Fatalf("coded block must emit >= k frames, got %d", len(out))
+	}
+	parity := 0
+	for _, f := range out {
+		if f.HasFlag(frame.FlagFECParity) {
+			parity++
+		}
+	}
+	if parity == 0 {
+		t.Fatal("coded block must carry parity frames")
+	}
+}
+
+// TestAdaptiveHysteresis: once coding turns on it holds for Hold even if
+// the loss drops; only after Hold expires below the resume threshold does
+// the encoder return to pass-through.
+func TestAdaptiveHysteresis(t *testing.T) {
+	params := adaptiveTestParams(0)
+	params.Adaptive.Hold = time.Second
+	enc, err := NewEncoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Turn coding on.
+	enc.SetLossRate(0.05)
+	// Loss disappears, but the hold window is still open → stays coding.
+	enc.SetLossRate(0)
+	f1 := &frame.Frame{SessionID: testSession, Seq: 1, Payload: []byte("x")}
+	if out := enc.Push(f1); len(out) != 0 {
+		t.Fatal("must still be coding during the hold window")
+	}
+	// Let the hold window expire, then re-evaluate with clean loss.
+	time.Sleep(1100 * time.Millisecond)
+	enc.SetLossRate(0)
+	f2 := &frame.Frame{SessionID: testSession, Seq: 2, Payload: []byte("y")}
+	out := enc.Push(f2)
+	// The frame buffered during coding flushes too — both pass-through.
+	if len(out) != 2 {
+		t.Fatalf("after hold expiry must flush pending + new frame pass-through, got %d", len(out))
+	}
+	for _, got := range out {
+		if got.BlockSeq != 0 {
+			t.Fatalf("post-hold frames must be pass-through (block_seq=0), got %d", got.BlockSeq)
+		}
+	}
+}
+
+// TestAdaptiveParityScalesWithLoss: more loss → more redundancy (up to the
+// ceiling).
+func TestAdaptiveParityScalesWithLoss(t *testing.T) {
+	enc, err := NewEncoder(adaptiveTestParams(0.5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc.SetLossRate(0.02)
+	low := enc.parityForLoss(0.02)
+	enc.SetLossRate(0.30)
+	high := enc.parityForLoss(0.30)
+	if high <= low {
+		t.Fatalf("parity must scale with loss: low=%d high=%d", low, high)
+	}
+	if enc.parityForLoss(0.5) > enc.params.ParityShards {
+		t.Fatal("parity must never exceed the configured ceiling")
+	}
+}
+
+// TestAdaptiveTransitionFlushesPending: frames buffered during a coding
+// period are flushed (un-stamped) when the encoder drops back to
+// pass-through — they must not wait for the block timeout.
+func TestAdaptiveTransitionFlushesPending(t *testing.T) {
+	params := adaptiveTestParams(0)
+	params.Adaptive.Hold = 0
+	enc, err := NewEncoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc.SetLossRate(0.05) // coding on
+	// Fill 2 of k=4 frames (block not complete).
+	for i := 1; i <= 2; i++ {
+		f := &frame.Frame{SessionID: testSession, Seq: uint32(i), Payload: []byte{byte(i)}}
+		if out := enc.Push(f); len(out) != 0 {
+			t.Fatalf("partial block must not emit")
+		}
+	}
+	// Loss drops → pass-through: the 2 pending frames must come out at once.
+	enc.SetLossRate(0)
+	f := &frame.Frame{SessionID: testSession, Seq: 3, Payload: []byte{3}}
+	out := enc.Push(f)
+	if len(out) != 3 {
+		t.Fatalf("transition must flush 2 pending + 1 new frame, got %d", len(out))
+	}
+	for _, got := range out {
+		if got.BlockSeq != 0 {
+			t.Fatalf("flushed frames must be pass-through (block_seq=0), got %d", got.BlockSeq)
+		}
+	}
+}
+
+// adaptiveTestParams builds adaptive codec params: k=4, ceiling 50% loss,
+// on-threshold 2%, resume 0.5%. The parity ceiling is never 0 (a 0-ceiling
+// codec would be disabled entirely).
+func adaptiveTestParams(loss float64) Params {
+	p := int(math.Ceil(4 * loss / (1 - loss)))
+	if p < 1 {
+		p = 1
+	}
+	return Params{
+		DataShards:   4,
+		ParityShards: p,
+		BlockTimeout: 8 * time.Millisecond,
+		Adaptive: &AdaptiveParams{
+			OnLossPct:  2,
+			OffLossPct: 0.5,
+			Hold:       0,
+			MaxLossPct: 50,
+			Safety:     1.3,
+		},
 	}
 }
 

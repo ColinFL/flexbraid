@@ -144,10 +144,15 @@ func fecParamsFor(cfg *config.Config, wan *config.WAN) (fec.Params, error) {
 		k = f.DataShards
 	}
 	var parity int
+	var adaptive *fec.AdaptiveParams
 	switch f.Mode {
 	case config.FECFixed:
 		parity = int(math.Ceil(float64(k) * f.FixedOverheadPct / 100.0))
 	case config.FECAdaptive:
+		// The configured max_loss_pct is the REDUNDANCY CEILING; the
+		// encoder sizes actual parity on the fly from the measured loss
+		// (fec.Params.Adaptive + Encoder.SetLossRate). On a clean link it
+		// codes nothing at all — zero latency, zero overhead.
 		l := f.MaxLossPct / 100.0
 		if wan != nil && wan.FECMaxLossPct != nil {
 			l = *wan.FECMaxLossPct / 100.0
@@ -156,6 +161,13 @@ func fecParamsFor(cfg *config.Config, wan *config.WAN) (fec.Params, error) {
 			return fec.Params{}, fmt.Errorf("invalid fec max_loss_pct %v (must be 0 < x < 100)", l*100)
 		}
 		parity = int(math.Ceil(float64(k) * l / (1 - l)))
+		adaptive = &fec.AdaptiveParams{
+			OnLossPct:  f.AdaptMinLossPct,
+			OffLossPct: f.AdaptResumePct,
+			Hold:       time.Duration(f.AdaptHoldSec * float64(time.Second)),
+			MaxLossPct: f.MaxLossPct,
+			Safety:     1.3,
+		}
 	default:
 		return fec.Params{}, fmt.Errorf("unknown fec.mode %q", f.Mode)
 	}
@@ -168,7 +180,7 @@ func fecParamsFor(cfg *config.Config, wan *config.WAN) (fec.Params, error) {
 	if k+parity > 256 {
 		return fec.Params{}, fmt.Errorf("fec geometry too large: k=%d + parity=%d > 256 (reduce data_shards or max_loss_pct)", k, parity)
 	}
-	params := fec.Params{DataShards: k, ParityShards: parity, BlockTimeout: timeout}
+	params := fec.Params{DataShards: k, ParityShards: parity, BlockTimeout: timeout, Adaptive: adaptive}
 	// P2: the largest parity frame must fit the path MTU without IP
 	// fragmentation. Fail fast with the exact bound instead of silently
 	// fragmenting (or dropping) parity frames.
@@ -747,6 +759,9 @@ func (c *Client) healthTickLoop(ctx context.Context) {
 						wan.health.ObserveInBand(rate)
 					}
 				}
+				// Adaptive FEC: feed the encoder this path's loss estimate
+				// so it can code/pass-through accordingly (fec.Params.Adaptive).
+				wan.enc.SetLossRate(wan.health.Loss())
 				before := wan.health.State()
 				wan.health.Tick(now)
 				after := wan.health.State()

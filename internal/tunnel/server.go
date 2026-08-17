@@ -662,6 +662,7 @@ func (s *Server) healthTickLoop(ctx context.Context) {
 				if sess == nil {
 					continue
 				}
+				maxPathLoss := 0.0
 				for pathKey, ps := range st.paths {
 					// Silence watchdog: when NOTHING arrives on a path for
 					// several probe intervals — no data, no keepalives — it
@@ -698,6 +699,16 @@ func (s *Server) healthTickLoop(ctx context.Context) {
 							"path", pathKey, "state", after.String())
 					}
 					st.sched.OnState(pathKey, after, ps.health.Loss())
+					// Adaptive FEC: drive the session encoder from the
+					// WORST path's loss — a block may be scheduled onto any
+					// of the session's paths, so redundancy must cover the
+					// least reliable one.
+					if loss := ps.health.Loss(); loss > maxPathLoss {
+						maxPathLoss = loss
+					}
+				}
+				if sess.Enc != nil {
+					sess.Enc.SetLossRate(maxPathLoss)
 				}
 			}
 			s.statesMu.Unlock()

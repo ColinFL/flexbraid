@@ -90,6 +90,9 @@ func (c *Client) WGAddr() *net.UDPAddr {
 type FrameCodec interface {
 	Push(*frame.Frame) []*frame.Frame
 	Tick(time.Time) []*frame.Frame
+	// SetLossRate feeds the session's worst-path loss estimate (0..1) so
+	// an adaptive encoder can code/pass-through accordingly.
+	SetLossRate(float64)
 }
 
 // ServerSession is the server-side state for one tunnel.

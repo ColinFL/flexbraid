@@ -136,9 +136,18 @@ type FEC struct {
 	Enabled          bool    `yaml:"enabled"`
 	Mode             FECMode `yaml:"mode"`
 	DataShards       int     `yaml:"data_shards"`        // data frames per block (default 10; games: 4–6)
-	MaxLossPct       float64 `yaml:"max_loss_pct"`       // compensable loss % per path
-	BlockTimeoutMS   int     `yaml:"block_timeout_ms"`   // block collection window (adds latency)
+	MaxLossPct       float64 `yaml:"max_loss_pct"`       // redundancy ceiling (adaptive) / fixed target (fixed)
+	BlockTimeoutMS   int     `yaml:"block_timeout_ms"`   // block collection window (adds latency when coding)
 	FixedOverheadPct float64 `yaml:"fixed_overhead_pct"` // overhead used when mode=fixed
+
+	// Adaptive thresholds (mode: adaptive): coding switches ON when the
+	// measured path loss reaches AdaptMinLossPct and OFF below
+	// AdaptResumePct after at least AdaptHoldSec — so a clean link runs
+	// pass-through (zero latency/overhead) and coding only engages when
+	// there is actually something to repair.
+	AdaptMinLossPct float64 `yaml:"adapt_min_loss_pct"` // default 2
+	AdaptResumePct  float64 `yaml:"adapt_resume_pct"`   // default 0.5
+	AdaptHoldSec    float64 `yaml:"adapt_hold_sec"`     // default 10
 }
 
 // WAN describes one physical uplink / path.
@@ -305,6 +314,24 @@ func (c *Config) Validate() error {
 		}
 		if c.FEC.BlockTimeoutMS <= 0 {
 			c.FEC.BlockTimeoutMS = 8
+		}
+		if c.FEC.AdaptMinLossPct == 0 {
+			c.FEC.AdaptMinLossPct = 2
+		}
+		if c.FEC.AdaptResumePct == 0 {
+			c.FEC.AdaptResumePct = 0.5
+		}
+		if c.FEC.AdaptHoldSec == 0 {
+			c.FEC.AdaptHoldSec = 10
+		}
+		if c.FEC.AdaptMinLossPct <= 0 || c.FEC.AdaptMinLossPct > 90 {
+			return fmt.Errorf("fec.adapt_min_loss_pct must be in (0,90], got %v", c.FEC.AdaptMinLossPct)
+		}
+		if c.FEC.AdaptResumePct < 0 || c.FEC.AdaptResumePct >= c.FEC.AdaptMinLossPct {
+			return fmt.Errorf("fec.adapt_resume_pct must be in [0, adapt_min_loss_pct), got %v", c.FEC.AdaptResumePct)
+		}
+		if c.FEC.AdaptHoldSec < 0 || c.FEC.AdaptHoldSec > 3600 {
+			return fmt.Errorf("fec.adapt_hold_sec must be in [0,3600], got %v", c.FEC.AdaptHoldSec)
 		}
 		if c.FEC.Mode == FECFixed && (c.FEC.FixedOverheadPct <= 0 || c.FEC.FixedOverheadPct > 200) {
 			return fmt.Errorf("fec.fixed_overhead_pct must be in (0,200], got %v", c.FEC.FixedOverheadPct)

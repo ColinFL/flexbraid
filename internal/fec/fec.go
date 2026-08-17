@@ -26,6 +26,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -37,10 +38,33 @@ import (
 const DefaultDataShards = 10
 
 // Params describes a codec. ParityShards == 0 disables coding.
+//
+// Adaptive, when non-nil, turns the encoder into a live-adaptive FEC (M3.1):
+// while the measured loss of the path stays below Adaptive.OnLossPct the
+// encoder runs pass-through (zero latency, zero overhead); once loss rises
+// above it, coding kicks in with parity sized to the current loss (with
+// safety margin, capped by ParityShards). Adaptive.Hold prevents flapping.
+// Parity frames are self-describing, so the receiver needs no negotiation
+// and mixed blocks/pass-through interleave safely.
 type Params struct {
 	DataShards   int
 	ParityShards int
 	BlockTimeout time.Duration
+	Adaptive     *AdaptiveParams // nil = always code (fixed mode)
+}
+
+// AdaptiveParams tunes live-adaptive FEC (Params.Adaptive).
+type AdaptiveParams struct {
+	// OnLossPct: enable coding when the measured loss reaches this %.
+	OnLossPct float64
+	// OffLossPct: disable coding when loss drops below this %.
+	OffLossPct float64
+	// Hold: minimum time coding stays enabled once turned on (anti-flap).
+	Hold time.Duration
+	// MaxLossPct: redundancy ceiling — never more than L/(1−L) of this.
+	MaxLossPct float64
+	// Safety: redundancy multiplier over the theoretical L/(1−L) (≥1).
+	Safety float64
 }
 
 // Enabled reports whether coding is active.
@@ -68,6 +92,12 @@ func ParityHeaderSize(dataShards int) int {
 
 // Encoder turns data frames into FEC blocks. Safe for concurrent use
 // (Push from the data loop, Tick from the tunnel's ticker).
+//
+// In adaptive mode the encoder toggles between pass-through (loss below
+// the on-threshold) and coding (loss at/above it), and re-sizes its
+// redundancy to the current loss. Both transitions are safe for the
+// receiver: pass-through frames carry block_seq=0 (delivered immediately),
+// coded blocks carry the parity sub-header (self-describing).
 type Encoder struct {
 	mu     sync.Mutex
 	params Params
@@ -76,6 +106,12 @@ type Encoder struct {
 	block      uint32 // next block_seq (per WAN, per direction)
 	pending    []*frame.Frame
 	blockStart time.Time
+
+	// adaptive state (only when params.Adaptive != nil)
+	lossRate    float64 // latest path loss estimate (0..1), SetLossRate
+	codingOn    bool    // current decision: code vs pass-through
+	codingSince time.Time
+	rsParity    int // parity shards the current rs encoder was built with
 }
 
 // NewEncoder builds an RS encoder for the given params.
@@ -86,30 +122,112 @@ func NewEncoder(p Params) (*Encoder, error) {
 	if p.BlockTimeout <= 0 {
 		p.BlockTimeout = 8 * time.Millisecond
 	}
-	var rs reedsolomon.Encoder
+	e := &Encoder{params: p, codingOn: p.Adaptive == nil, rsParity: p.ParityShards}
 	if p.Enabled() {
 		var err error
-		rs, err = reedsolomon.New(p.DataShards, p.ParityShards)
+		e.rs, err = reedsolomon.New(p.DataShards, p.ParityShards)
 		if err != nil {
 			return nil, fmt.Errorf("fec: rs.New(%d,%d): %w", p.DataShards, p.ParityShards, err)
 		}
 	}
-	return &Encoder{params: p, rs: rs}, nil
+	return e, nil
 }
 
 // Params returns the codec parameters.
 func (e *Encoder) Params() Params { return e.params }
 
+// SetLossRate feeds the path's current loss estimate (0..1) into the
+// encoder; in adaptive mode this drives the code/pass-through decision and
+// the redundancy sizing. Call from the health tick loop (a few times per
+// second). Safe for concurrent use.
+func (e *Encoder) SetLossRate(rate float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if rate < 0 {
+		rate = 0
+	}
+	if rate > 1 {
+		rate = 1
+	}
+	e.lossRate = rate
+	e.refreshLocked(time.Now())
+}
+
+// refreshLocked re-evaluates the code/pass-through decision and rebuilds
+// the RS encoder when the required redundancy changed.
+func (e *Encoder) refreshLocked(now time.Time) {
+	if e.params.Adaptive == nil {
+		e.codingOn = true
+		return
+	}
+	a := e.params.Adaptive
+	lossPct := e.lossRate * 100
+	if !e.codingOn {
+		if lossPct >= a.OnLossPct {
+			e.codingOn = true
+			e.codingSince = now
+		}
+	} else if lossPct < a.OffLossPct && now.Sub(e.codingSince) >= a.Hold {
+		e.codingOn = false
+	}
+	if e.codingOn {
+		parity := e.parityForLoss(e.lossRate)
+		if parity != e.rsParity {
+			rs, err := reedsolomon.New(e.params.DataShards, parity)
+			if err != nil {
+				return // keep the old encoder; sizing is best-effort
+			}
+			e.rs = rs
+			e.rsParity = parity
+		}
+	}
+}
+
+// parityForLoss sizes the redundancy for the current loss: the theoretical
+// L/(1−L) times the safety margin, capped by the configured ceiling
+// (max_loss_pct) and the RS field bound (data+parity ≤ 256).
+func (e *Encoder) parityForLoss(loss float64) int {
+	a := e.params.Adaptive
+	k := e.params.DataShards
+	target := loss / (1 - loss) * a.Safety
+	capLoss := a.MaxLossPct / 100.0
+	if cap := capLoss / (1 - capLoss); target > cap {
+		target = cap
+	}
+	parity := int(math.Ceil(float64(k) * target))
+	if parity < 1 {
+		parity = 1
+	}
+	if k+parity > 256 {
+		parity = 256 - k
+	}
+	if parity > e.params.ParityShards {
+		parity = e.params.ParityShards
+	}
+	return parity
+}
+
 // Push accepts a data frame and returns frames to transmit: nothing while a
 // block is still filling, or the completed block (data + parity) once k data
-// frames are collected. The returned frames must be stamped with their seq
-// and session by the caller; parity frames copy the session of the first
-// data frame in the block.
+// frames are collected. In pass-through (adaptive off, or FEC disabled) the
+// frame is returned immediately. The returned frames must be stamped with
+// their seq and session by the caller; parity frames copy the session of the
+// first data frame in the block.
 func (e *Encoder) Push(f *frame.Frame) []*frame.Frame {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.params.Enabled() {
 		return []*frame.Frame{f}
+	}
+	e.refreshLocked(time.Now())
+	if !e.codingOn {
+		// Pass-through: flush anything left over from a coding period
+		// (frames that never reached k or a timeout) un-stamped, then the
+		// current frame. block_seq=0 tells the decoder to deliver at once.
+		out := e.pending
+		e.pending = nil
+		out = append(out, f)
+		return out
 	}
 	if len(e.pending) == 0 {
 		e.blockStart = time.Now()
@@ -123,11 +241,21 @@ func (e *Encoder) Push(f *frame.Frame) []*frame.Frame {
 
 // Tick flushes a short block whose fill time exceeded BlockTimeout. It
 // returns nothing unless there is an overdue block with fewer than k frames.
-// Call from the tunnel's ticker.
+// A coding→pass-through transition also flushes pending frames here. Call
+// from the tunnel's ticker.
 func (e *Encoder) Tick(now time.Time) []*frame.Frame {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.params.Enabled() || len(e.pending) == 0 {
+	if !e.params.Enabled() {
+		return nil
+	}
+	e.refreshLocked(now)
+	if !e.codingOn {
+		out := e.pending
+		e.pending = nil
+		return out
+	}
+	if len(e.pending) == 0 {
 		return nil
 	}
 	if now.Before(e.blockStart.Add(e.params.BlockTimeout)) {
@@ -146,7 +274,9 @@ func (e *Encoder) Tick(now time.Time) []*frame.Frame {
 }
 
 // emitBlock seals the current block: stamps block_seq on the data frames,
-// computes parity and returns data frames followed by parity frames.
+// computes parity and returns data frames followed by parity frames. The
+// number of parity frames is the encoder's CURRENT redundancy (dynamic in
+// adaptive mode), not the configured ceiling.
 func (e *Encoder) emitBlock() []*frame.Frame {
 	e.block++
 	bs := e.block
@@ -159,7 +289,8 @@ func (e *Encoder) emitBlock() []*frame.Frame {
 			maxLen = len(f.Payload)
 		}
 	}
-	n := e.params.DataShards + e.params.ParityShards
+	parity := e.rsParity
+	n := e.params.DataShards + parity
 	shards := make([][]byte, n)
 	for i := 0; i < n; i++ {
 		shards[i] = make([]byte, maxLen)
@@ -176,7 +307,7 @@ func (e *Encoder) emitBlock() []*frame.Frame {
 		return data
 	}
 
-	out := make([]*frame.Frame, 0, len(data)+e.params.ParityShards)
+	out := make([]*frame.Frame, 0, len(data)+parity)
 	for _, f := range data {
 		f.BlockSeq = bs
 		out = append(out, f)
@@ -190,7 +321,7 @@ func (e *Encoder) emitBlock() []*frame.Frame {
 		binary.BigEndian.PutUint16(sub[parityHdrFixed+4*e.params.DataShards+2*i:], uint16(len(f.Payload)))
 	}
 	binary.BigEndian.PutUint16(sub[4:6], uint16(maxLen))
-	for i := 0; i < e.params.ParityShards; i++ {
+	for i := 0; i < parity; i++ {
 		pf := &frame.Frame{
 			SessionID: data[0].SessionID,
 			BlockSeq:  bs,

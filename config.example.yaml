@@ -24,12 +24,16 @@ scheduler:
 fec:
   enabled: true
   mode: adaptive        # "adaptive" | "fixed" | "off" | "crosspath"(M4)
-                        # NOTE: adaptive computes redundancy once from
-                        # max_loss_pct; live adaptation is TODO(M4).
+                        # adaptive = LIVE: no loss → pass-through (0 latency,
+                        # 0 overhead); loss ≥ adapt_min_loss_pct → coding with
+                        # redundancy sized to measured loss.
   data_shards: 10       # data frames per RS block (games: 4–6, see docs)
-  max_loss_pct: 20      # compensable random-loss % per path (0–90)
-  block_timeout_ms: 8   # block collection window; adds latency (games: 10–15)
+  max_loss_pct: 20      # redundancy ceiling (compensable random-loss % per path)
+  block_timeout_ms: 8   # block collection window; adds latency only while coding
   fixed_overhead_pct: 25  # used only when mode: fixed
+  adapt_min_loss_pct: 2  # coding ON when measured loss ≥ 2%
+  adapt_resume_pct: 0.5  # coding OFF when loss < 0.5%
+  adapt_hold_sec: 10     # minimum time coding stays on (anti-flap)
 
 # --- WANs: one entry per physical uplink (any number) --------------------
 wans:

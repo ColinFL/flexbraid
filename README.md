@@ -43,9 +43,10 @@ traffic across your WANs and instantly re-routes around a dead one.
 - **Active load balancing**, weighted by each WAN's real bandwidth — or a
   **warm-standby** mode for near-zero-loss failover with no load splitting.
 - **Forward error correction, fully disable-able** — Reed–Solomon erasure
-  coding with a tunable compensable-loss percentage per path (live adaptation
-  from measured loss arrives with the M3 health monitor), or switched off
-  entirely on clean lines.
+  coding with a tunable compensable-loss percentage per path. **Live-adaptive**:
+  on a clean link it runs pass-through (zero latency, zero overhead); when
+  loss appears it codes with redundancy sized to the measured loss. Can be
+  switched off entirely.
 - **Flexible & configurable**: any number of WANs, per-link transport
   (`udp` / `faketcp` / `icmp`), per-link FEC %, scheduler policy, health
   thresholds — all from one YAML file.
@@ -126,7 +127,9 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 - **M3 — Scheduler + health** *(done)*: `lb`/`standby` (standby honours the
   DEGRADED state — it abandons a path whose loss exceeds FEC capacity, not
   just a dead one), per-WAN socket binding (`iface`/`local_ip`), EWMA monitor,
-  circuit breaker with in-band loss telemetry and a silence watchdog.
+  circuit breaker with in-band loss telemetry and a silence watchdog,
+  **live-adaptive FEC** (pass-through on clean links, coding sized to
+  measured loss when it appears).
 - **M4 — Resilience:** endpoint migration, warm failover, FakeTCP/ICMP,
   cross-path FEC.
 - **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging.

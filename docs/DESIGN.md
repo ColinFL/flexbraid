@@ -244,21 +244,31 @@ overhead = L / (1 − L)
 3. **FEC is per-path tunable.** Different WANs may have different quality.
 
 ### 6.3 Adaptive redundancy
-**M2 status:** redundancy is computed **once** from `max_loss_pct` at startup
-(`L / (1 − L)`, clamped ≥ 1 parity shard) — the code path is static today, and
-the mode name `adaptive` reflects the intended behaviour, not the current one.
-**TODO(M3):** with the health monitor in place, recompute the desired
-redundancy from the measured loss estimate each interval instead:
+**M3.1 status: implemented.** In `mode: adaptive` the encoder is fed the
+path's measured loss estimate (health monitor: keepalive EWMA + in-band
+telemetry) via `Encoder.SetLossRate` and decides per period:
+
+- loss below `adapt_min_loss_pct` (default 2%) → **pass-through**: frames
+  leave immediately with `block_seq=0`, zero latency, zero overhead — a
+  clean link costs nothing;
+- loss at/above the threshold → coding on, redundancy sized live as
 
 ```
-target_overhead = clamp( L̂ / (1 − L̂) * (1 + safety_margin),
-                         min_overhead, max_overhead )
+target_overhead = clamp( L̂ / (1 − L̂) * safety_margin,
+                         ≥ 1 parity, max_loss_pct ceiling )
 ```
-- `safety_margin` (default ~0.2) keeps headroom above the measured loss.
-- `min_overhead` can be 0 so a clean WAN carries **zero** redundancy.
-- If the measured loss exceeds what the configured FEC can compensate, the
-  circuit breaker starts to pull that WAN out of service (the FEC "limps
-  along" first; the breaker handles sustained overload).
+
+- `safety_margin` (1.3) keeps headroom above the measured loss;
+- `adapt_hold_sec` (default 10 s) prevents flapping: once coding is on it
+  stays on for at least that long even if loss vanishes;
+- `adapt_resume_pct` (default 0.5%) is the lower bound to switch back off.
+
+Transitions are safe on the wire: pass-through frames and coded blocks
+interleave freely (parity sub-headers are self-describing, `block_seq=0`
+delivers immediately — mixed-FEC decoder support). If the measured loss
+exceeds what the configured FEC can compensate, the circuit breaker pulls
+that WAN out of service (the FEC "limps along" first; the breaker handles
+sustained overload).
 
 ### 6.4 Optional: cross-path FEC
 A mode where RS blocks are spread across **all** WANs such that the block is
@@ -510,8 +520,9 @@ so new wire formats are drop-in.
 Full reference in [CONFIG.md](CONFIG.md). Highlights:
 - `wans[].capacity_mbps` — declared bandwidth, drives capacity-weighted balancing.
 - `fec.enabled`, `fec.mode` (`adaptive`/`fixed`/`off`/`crosspath`),
-  `fec.max_loss_pct`, `fec.block_timeout_ms` — per-link FEC; can be disabled
-  entirely.
+  `fec.max_loss_pct` (redundancy ceiling), `fec.data_shards`,
+  `fec.block_timeout_ms`, `fec.adapt_*` (live adaptation thresholds) —
+  per-link FEC; can be disabled entirely.
 - `scheduler.mode` (`lb`/`standby`), `scheduler.affinity` (`flow`/`packet`),
   `scheduler.balance_by` (`capacity`/`fec`/`roundrobin`),
   `scheduler.capacity_cap_mbps` (server-side clamp on declared capacity).

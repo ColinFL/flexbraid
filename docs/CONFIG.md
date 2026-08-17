@@ -84,17 +84,32 @@ fec:
   is accepted (useful on clean lines / latency-critical use). With FEC
   disabled the health monitor's degrade threshold drops to a 1% noise
   floor: **any** sustained loss degrades the path.
-- `adaptive` *(default)* — redundancy computed once from `max_loss_pct`
-  (live adaptation from measured loss is TODO(M4)).
-- `fixed` — constant `fixed_overhead_pct` redundancy.
+- `adaptive` *(default)* — **live-adaptive FEC**: the encoder measures the
+  path's loss (keepalive + in-band telemetry) and only codes when there is
+  something to repair:
+  - loss below `adapt_min_loss_pct` → **pass-through**: zero latency, zero
+    overhead (a clean link runs exactly like `fec.enabled: false`);
+  - loss at/above the threshold → coding turns on with redundancy sized to
+    the current loss (theoretical L/(1−L) × 1.3 safety margin), capped by
+    `max_loss_pct`;
+  - `adapt_hold_sec` prevents flapping (once coding is on, it stays on for
+    at least that long); `adapt_resume_pct` is the lower bound to switch
+    back off.
+  Parity frames are self-describing, so both ends interleave pass-through
+  frames and coded blocks without negotiation.
+- `fixed` — constant `fixed_overhead_pct` redundancy, always on.
 - `crosspath` — code erasure blocks across all WANs to survive a whole-WAN
   loss (costs capacity). **Requires `scheduler.affinity: packet`. Not
   implemented until M4.**
-- `data_shards` — block size. Sparse traffic (games ~50–200 pps) rarely
-  fills a 10-frame block within 8 ms, so blocks flush short without parity
-  and FEC stays idle. For interactive traffic use `data_shards: 4` and
-  `block_timeout_ms: 10–15` (adds ~10–15 ms latency, but parity actually
-  flies). Constraint: `data_shards + parity ≤ 256` (RS field bound).
+- `data_shards` — block size. When coding is active, sparse traffic (games
+  ~50–200 pps) rarely fills a 10-frame block within `block_timeout_ms`, so
+  blocks flush short without parity and FEC stays idle. For interactive
+  traffic use `data_shards: 4` and `block_timeout_ms: 10–15` (adds ~10–15
+  ms latency only while coding is actually on). Constraint:
+  `data_shards + parity ≤ 256` (RS field bound).
+
+Adaptive thresholds (defaults): `adapt_min_loss_pct: 2`, `adapt_resume_pct: 0.5`,
+`adapt_hold_sec: 10`.
 
 Compensable-loss math (random loss within a working path):
 
