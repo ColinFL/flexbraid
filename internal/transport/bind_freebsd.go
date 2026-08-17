@@ -2,24 +2,12 @@
 
 package transport
 
-import (
-	"fmt"
-	"net"
+import "fmt"
 
-	"golang.org/x/sys/unix"
-)
-
-// ipBoundIf is IP_BOUND_IF from <netinet/in.h> (FreeBSD ≥ 12): bind a UDP
-// socket to a particular interface by index. It is not exported by
-// x/sys/unix for freebsd (only darwin/solaris), so it is defined here.
-const ipBoundIf = 53
-
-// setDeviceBinding pins the socket to a device via IP_BOUND_IF, which
-// requires the interface index.
+// setDeviceBinding pins the socket to a device. IP_BOUND_IF existed on
+// FreeBSD 12–14 but was removed in 15, so on modern OPNsense/FreeBSD this
+// always fails. The caller falls back to source-address binding (local_ip)
+// or fails with an actionable error (see UDP.dialBound).
 func setDeviceBinding(fd int, iface string) error {
-	ifi, err := net.InterfaceByName(iface)
-	if err != nil {
-		return fmt.Errorf("interface %q: %w", iface, err)
-	}
-	return unix.SetsockoptInt(fd, unix.IPPROTO_IP, ipBoundIf, ifi.Index)
+	return fmt.Errorf("%w (IP_BOUND_IF removed in FreeBSD 15; configure wan.local_ip with policy routing — pf route-to / setfib — to pin a socket to an uplink)", ErrDeviceBindUnsupported)
 }

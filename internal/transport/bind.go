@@ -1,10 +1,17 @@
 package transport
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"syscall"
 )
+
+// ErrDeviceBindUnsupported is returned when the platform cannot bind a
+// socket to a device at all (e.g. FreeBSD 15 removed IP_BOUND_IF from the
+// kernel). UDP.dialBound treats it like EPERM: fall back to local_ip when
+// configured, otherwise fail with an actionable error.
+var ErrDeviceBindUnsupported = errors.New("device binding is not supported on this platform")
 
 // Bind pins a client WAN socket to one physical uplink. Without it the
 // kernel routes every socket through the default route, and multi-WAN

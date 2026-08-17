@@ -79,8 +79,14 @@ func (u *UDP) openClient() error {
 }
 
 // dialBound tries, in order: device binding (iface) → source binding
-// (local_ip) → plain dial. A permission error on the device bind is not
-// fatal when a local_ip fallback is configured (unprivileged daemons).
+// (local_ip) → plain dial.
+//
+// A device-bind failure falls back to local_ip when one is configured —
+// both for permission errors (unprivileged daemons) and for platforms
+// without device binding at all (FreeBSD 15 removed IP_BOUND_IF). When no
+// fallback exists the error is returned with an actionable hint, because a
+// silently unbound socket routes through the default route and multi-WAN
+// collapses onto one uplink without any visible sign.
 func (u *UDP) dialBound(raddr *net.UDPAddr) (*net.UDPConn, error) {
 	if u.bind.Iface != "" {
 		iface := u.bind.Iface
@@ -91,11 +97,13 @@ func (u *UDP) dialBound(raddr *net.UDPAddr) (*net.UDPConn, error) {
 		if err == nil {
 			return conn, nil
 		}
-		if !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EACCES) {
-			return nil, err // real failure, not a permissions issue
+		fallback := errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) ||
+			errors.Is(err, ErrDeviceBindUnsupported)
+		if !fallback {
+			return nil, err // real failure (bad interface name, etc.)
 		}
 		if u.bind.LocalIP == "" {
-			return nil, fmt.Errorf("bind to device %q denied (need root/CAP_NET_RAW); set wan.local_ip to bind the source address instead: %w", u.bind.Iface, err)
+			return nil, fmt.Errorf("bind to device %q failed (%w); set wan.local_ip to bind the source address instead, or run with sufficient privileges", u.bind.Iface, err)
 		}
 	}
 	if u.bind.LocalIP != "" {

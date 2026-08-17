@@ -181,6 +181,14 @@ func (s *Server) Run(ctx context.Context) error {
 	// Circuit breakers for every session's paths.
 	go s.healthTickLoop(ctx)
 
+	// wanLoop sits in wanTr.Recv() and only returns when the socket is
+	// closed; close it the moment the context dies, or SIGTERM would
+	// hang forever (the defer below runs only after wanLoop returns).
+	go func() {
+		<-ctx.Done()
+		s.wanTr.Close()
+	}()
+
 	err := s.wanLoop(ctx)
 	<-sweepDone
 	return err

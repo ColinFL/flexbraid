@@ -288,6 +288,19 @@ func (d *Decoder) Push(path string, f *frame.Frame) []*frame.Frame {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.params.Enabled() {
+		// Pass-through: an FEC-less decoder must still not leak the
+		// sender's parity frames into the inner stream.
+		if f.HasFlag(frame.FlagFECParity) {
+			return nil
+		}
+		return []*frame.Frame{f}
+	}
+	// A zero block_seq means the SENDER has FEC disabled: its frames
+	// carry no block structure and must be delivered immediately.
+	// (FEC encoders always stamp blocks starting at 1, so 0 is
+	// unambiguous — without this, the lastFlushed guard below would
+	// drop every such frame as "block already delivered".)
+	if !f.HasFlag(frame.FlagFECParity) && f.BlockSeq == 0 {
 		return []*frame.Frame{f}
 	}
 	key := blockKey{sessionID: f.SessionID, path: path, blockSeq: f.BlockSeq}

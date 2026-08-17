@@ -387,6 +387,18 @@ func (c *Client) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Unblock the blocking loops on shutdown: ingressLoop sits in
+	// ReadFromUDP and recvLoops in tr.Recv(), and neither returns while
+	// its socket is open — so the sockets must be closed the moment the
+	// context dies, not after the loops return (that would deadlock).
+	go func() {
+		<-ctx.Done()
+		c.ingress.Close()
+		for _, wan := range c.wans {
+			wan.tr.Close()
+		}
+	}()
+
 	// One handshake + keepalive + recv loop per WAN.
 	var recvWG sync.WaitGroup
 	for _, wan := range c.wans {
@@ -414,8 +426,11 @@ func (c *Client) Run(ctx context.Context) error {
 		"affinity", c.cfg.Scheduler.Affinity)
 
 	err := c.ingressLoop(ctx)
+	// Loops may still be blocked if the goroutine above hasn't run yet;
+	// close again (idempotent) to guarantee they unblock before Wait.
+	c.ingress.Close()
 	for _, wan := range c.wans {
-		wan.tr.Close() // unblock recvLoops
+		wan.tr.Close()
 	}
 	recvWG.Wait()
 	return err

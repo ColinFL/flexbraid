@@ -72,6 +72,41 @@ func assertDelivered(t *testing.T, delivered []*frame.Frame, wantSeq []uint32) {
 	}
 }
 
+// TestMixedFECModes: an FEC decoder must handle a sender whose FEC is
+// disabled — frames with block_seq=0 carry no block structure and are
+// delivered immediately (the lastFlushed guard would otherwise drop them
+// as "already delivered"). Conversely, a pass-through decoder must not
+// leak parity frames into the inner stream.
+func TestMixedFECModes(t *testing.T) {
+	// 1) FEC-enabled decoder receiving an FEC-less sender's frames.
+	params := Params{DataShards: 4, ParityShards: 1, BlockTimeout: 15 * time.Millisecond}
+	dec, err := NewDecoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &frame.Frame{SessionID: 1, Seq: 7, BlockSeq: 0, Payload: []byte("no-fec")}
+	got := dec.Push("w1", f)
+	if len(got) != 1 || got[0].Seq != 7 {
+		t.Fatalf("FEC-off sender frame must be delivered immediately, got %d frames", len(got))
+	}
+
+	// 2) Pass-through (FEC-disabled) decoder receiving a parity frame
+	// from an FEC-enabled sender: must drop it, not leak it.
+	dec2, err := NewDecoder(Params{BlockTimeout: 15 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pf := &frame.Frame{SessionID: 1, Seq: 8, BlockSeq: 2, Payload: []byte("parity"),
+		Flags: frame.FlagFECParity}
+	if got := dec2.Push("w1", pf); len(got) != 0 {
+		t.Fatalf("pass-through decoder must drop parity frames, got %d", len(got))
+	}
+	df := &frame.Frame{SessionID: 1, Seq: 9, BlockSeq: 2, Payload: []byte("data")}
+	if got := dec2.Push("w1", df); len(got) != 1 {
+		t.Fatalf("pass-through decoder must deliver data frames, got %d", len(got))
+	}
+}
+
 // TestTakeStreamStats: the decoder accounts unrecovered loss per stream —
 // data frames missing when a block flushes. Recovered blocks count zero.
 func TestTakeStreamStats(t *testing.T) {
