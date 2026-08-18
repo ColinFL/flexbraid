@@ -37,9 +37,10 @@ jobs:
 
       - name: faketcp loopback (raw sockets, docker NET_RAW)
         # The unprivileged runner cannot open raw sockets; run the
-        # loopback transport test inside a container with NET_RAW.
+        # loopback transport test inside a container with NET_RAW
+        # (docker on GitHub runners needs sudo).
         run: |
-          docker run --rm --cap-add=NET_RAW \
+          sudo docker run --rm --cap-add=NET_RAW \
             -v "$PWD":/src -w /src golang:$(grep '^go ' go.mod | awk '{print $2}') \
             go test ./internal/transport/ -run 'TestFakeTCPLoopback' -v -count=1
 
