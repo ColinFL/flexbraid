@@ -462,11 +462,11 @@ only one entry is active at a time; switching just changes which entry is used
 
 Pluggable wire formats, configured per WAN (`wan.transport`):
 
-| Mode | Use case |
-|---|---|
-| `udp` | Default. Encrypted UDP tunnel. |
-| `faketcp` | Disguises the tunnel as TCP (3-way handshake + seq/ack simulation) to bypass UDP blocking/QoS. Derived from udp2raw's FakeTCP. Requires raw-socket + RST-suppression (iptables/nftables on Linux, pf on FreeBSD). |
-| `icmp` | Last-resort tunnel over ICMP echo for UDP-blocked links. |
+| Mode | Use case | Status |
+|---|---|---|
+| `udp` | Default. Encrypted UDP tunnel. | done |
+| `faketcp` | Disguises the tunnel as TCP (3-way handshake + seq/ack simulation) to bypass UDP blocking/QoS. Derived from udp2raw's FakeTCP. Requires raw-socket + RST-suppression (iptables/nftables on Linux, pf on FreeBSD). | **M4.2a done** |
+| `icmp` | Last-resort tunnel over ICMP echo for UDP-blocked links. | M4.2b (planned) |
 
 Each transport is a self-contained `Transport` interface (open/close/send/recv)
 so new wire formats are drop-in.
@@ -554,10 +554,11 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
   EWMA monitoring, circuit breaker with in-band loss telemetry + silence
   watchdog, delivery buffer (reorder+jitter, configurable window), per-WAN
   socket binding (`iface`/`local_ip`). Per-WAN queues/rate-limit moved to M5.
-- **M4 — Multi-WAN resilience:** *(M4.1 cross-path FEC done)* — blocks
-  spread across all WANs (smooth WRR), parity floor via `protection_level`,
-  whole-WAN loss survivable at capacity cost. Remaining: FakeTCP + ICMP
-  transports, adaptive FEC (live redundancy adjustment from measured loss).
+- **M4 — Multi-WAN resilience:** *(M4.1 cross-path FEC + M4.2a FakeTCP
+  done)* — blocks spread across all WANs (smooth WRR), parity floor via
+  `protection_level`, whole-WAN loss survivable at capacity cost; FakeTCP
+  wire format (raw IPv4/TCP disguise). Remaining: ICMP transport, adaptive
+  FEC (live redundancy adjustment from measured loss).
 - **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging, docs
   site, authenticated key-exchange (forward secrecy).
 

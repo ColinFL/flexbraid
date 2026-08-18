@@ -45,7 +45,8 @@ fec:
 # --- WANs: one entry per physical uplink (any number) --------------------
 wans:
   - id: w1
-    transport: udp     # "udp" (M3) | "faketcp" | "icmp" (M4)
+    transport: udp     # "udp" | "faketcp" (M4.2a: raw TCP disguise, root+
+                        # RST suppression) | "icmp" (M4.2b, not yet)
     iface: igc1         # bind device (SO_BINDTODEVICE / IP_BOUND_IF).
                         # Requires root/CAP_NET_RAW; falls back to local_ip.
     local_ip: ""        # bind source address instead (no privileges; needs

@@ -5,9 +5,10 @@ Every setting has a sane default; you only need to write what differs.
 Unknown keys are a hard error (`KnownFields`), so a typo never silently
 disables a feature.
 
-> **Status:** M3 (multi-WAN scheduler + health) implemented, including the
-> M3.1 hardening: per-WAN socket binding, in-band loss telemetry, silence
-> watchdog, configurable delivery window and FEC geometry.
+> **Status:** M4.1 (cross-path FEC) and M4.2a (FakeTCP transport)
+> implemented on top of M3 (multi-WAN scheduler + health): per-WAN socket
+> binding, in-band loss telemetry, silence watchdog, live-adaptive and
+> cross-path FEC, `udp` + `faketcp` wire formats.
 
 ---
 
@@ -138,7 +139,8 @@ Compensable-loss math (random loss within a working path):
 ```yaml
 wans:
   - id: w1
-    transport: udp      # "udp" (M3) | "faketcp" | "icmp" (M4)
+    transport: udp      # "udp" | "faketcp" (M4.2a: raw TCP disguise, root+
+                        # RST suppression) | "icmp" (M4.2b, not yet)
     iface: igc1         # bind device (SO_BINDTODEVICE / IP_BOUND_IF)
     local_ip: 192.0.2.10  # bind source address (fallback)
     capacity_mbps: 300  # declared bandwidth → drives capacity-weighted balancing
@@ -164,7 +166,20 @@ wans:
 - **`capacity_mbps`** — how much FlexBraid trusts this WAN to carry. With
   `balance_by: capacity`, a 300 Mbps WAN gets ~3× the share of a 100 Mbps
   one. The server clamps it to `scheduler.capacity_cap_mbps` (see above).
-- `transport` — wire format on this WAN. `faketcp`/`icmp` arrive in M4.
+- `transport` — wire format on this WAN. `udp` (default) or `faketcp`
+  (server mode: the top-level `transport:` key). **`faketcp`** disguises the
+  tunnel as TCP: IPv4+TCP segments with a simulated 3-way handshake and
+  seq/ack walk (derived from udp2raw), for links that block or throttle
+  UDP. Requirements:
+  - **root / `CAP_NET_RAW`** on both ends (raw sockets, IPv4 only);
+  - **RST suppression on BOTH ends** — the kernel answers the fake
+    handshake with RST on the closed port, and NAT boxes tear down their
+    mapping on RST. Linux:
+    `iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP` (or the
+    equivalent nftables rule); FreeBSD: `pf` — `pass out proto tcp flags RST`
+    or a matching `block` rule;
+  - the listen/connect port must not be used by a real TCP listener.
+  `icmp` arrives in M4.2b.
 - `fec_max_loss_pct` overrides the global FEC cap per path (e.g. a flaky
   LTE link can carry more redundancy).
 
