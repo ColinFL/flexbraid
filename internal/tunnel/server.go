@@ -385,6 +385,12 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 func (s *Server) registerPath(sess *session.ServerSession, ua *net.UDPAddr, payload []byte) {
 	pathKey := ua.String()
 	st := s.stateFor(sess.ID)
+
+	// st.paths is mutated here (wanLoop goroutine) and ranged over by
+	// healthTickLoop — both must hold statesMu. lastSeen is read by
+	// pickPath from the egress goroutines, same lock.
+	s.statesMu.Lock()
+	defer s.statesMu.Unlock()
 	st.lastSeen = ua
 
 	ps := st.paths[pathKey]
@@ -435,7 +441,9 @@ func (s *Server) effectiveCapacityFor(capMbps float64) float64 {
 // silence is handled by the watchdog in healthTickLoop.
 func (s *Server) observeKeepalive(sess *session.ServerSession, pathKey string, ua *net.UDPAddr) {
 	st := s.stateFor(sess.ID)
+	s.statesMu.Lock()
 	ps := st.paths[pathKey]
+	s.statesMu.Unlock()
 	if ps == nil {
 		return // not registered (path cap) — ignore
 	}
@@ -553,6 +561,8 @@ func (s *Server) noteOversize(sess *session.ServerSession, n int) {
 // limping instead of stalling.
 func (s *Server) pickPath(sess *session.ServerSession) *net.UDPAddr {
 	st := s.stateFor(sess.ID)
+	s.statesMu.Lock()
+	defer s.statesMu.Unlock()
 	if pathKey, ok := st.sched.Pick(nil); ok {
 		if ps := st.paths[pathKey]; ps != nil {
 			return ps.addr
