@@ -9,8 +9,8 @@ server: 203.0.113.1:4096   # (client only) FlexBraid server address:port
 wg_peer: 127.0.0.1:51821   # (server only) inner WireGuard peer (egress target)
 session_id: auto        # "auto" (random) | <hex>; server keys sessions by this,
                         # NOT by source IP — the basis of seamless failover.
-mtu: 1390               # inner MTU. With FEC on: 1500 − 44 (frame+tag) − 66
-                        # (parity sub-header, k=10) = 1390; 1420 only with FEC off.
+mtu: 1388               # inner MTU. With FEC on: 1500 − 44 (frame+tag) − 68
+                        # (parity sub-header, k=10) = 1388; 1420 only with FEC off.
 
 # --- scheduler -----------------------------------------------------------
 scheduler:
@@ -23,10 +23,13 @@ scheduler:
 # --- forward error correction (can be fully disabled) --------------------
 fec:
   enabled: true
-  mode: adaptive        # "adaptive" | "fixed" | "off" | "crosspath"(M4)
+  mode: adaptive        # "adaptive" | "fixed" | "off" | "crosspath"
                         # adaptive = LIVE: no loss → pass-through (0 latency,
                         # 0 overhead); loss ≥ adapt_min_loss_pct → coding with
                         # redundancy sized to measured loss.
+                        # crosspath = blocks spread across ALL WANs: a whole
+                        # WAN failure loses only its share of each block,
+                        # recoverable via parity (needs affinity: packet).
   data_shards: 10       # data frames per RS block (games: 4–6, see docs)
   max_loss_pct: 20      # redundancy ceiling (compensable random-loss % per path)
   block_timeout_ms: 8   # block collection window; adds latency only while coding
@@ -34,6 +37,10 @@ fec:
   adapt_min_loss_pct: 2  # coding ON when measured loss ≥ 2%
   adapt_resume_pct: 0.5  # coding OFF when loss < 0.5%
   adapt_hold_sec: 10     # minimum time coding stays on (anti-flap)
+  protection_level: 0.5  # (crosspath) redundancy floor as fraction of
+                         # data_shards: 0.5 → ≥ ceil(k·0.5) parity per block.
+                         # 1.0 survives losing one whole WAN in a 2-WAN setup
+                         # (at 2× wire traffic); default 0.5.
 
 # --- WANs: one entry per physical uplink (any number) --------------------
 wans:

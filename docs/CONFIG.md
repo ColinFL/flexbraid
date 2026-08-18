@@ -21,8 +21,8 @@ server: 203.0.113.1:4096   # (client only) server address:port
 wg_peer: 127.0.0.1:51821   # (server only) inner WireGuard peer (egress target)
 session_id: auto      # "auto" (random) | <hex>. Server keys sessions by this,
                       # NOT by source IP — this is what makes failover seamless.
-mtu: 1390             # inner MTU. With FEC on: 1500 − 44 (frame+AEAD) − 66
-                      # (parity sub-header, k=10) = 1390; 1420 only with FEC
+mtu: 1388             # inner MTU. With FEC on: 1500 − 44 (frame+AEAD) − 68
+                      # (parity sub-header, k=10) = 1388; 1420 only with FEC
                       # off. Validated at startup.
 scheduler: {...}
 fec: {...}
@@ -73,7 +73,7 @@ scheduler:
 ```yaml
 fec:
   enabled: true        # false disables erasure coding entirely
-  mode: adaptive       # "adaptive" | "fixed" | "off" | "crosspath"(M4)
+  mode: adaptive       # "adaptive" | "fixed" | "off" | "crosspath"
   data_shards: 10      # data frames per RS block (2–64)
   max_loss_pct: 20     # compensable random-loss % per path (0–90)
   block_timeout_ms: 8  # block collection window; adds latency
@@ -98,9 +98,16 @@ fec:
   Parity frames are self-describing, so both ends interleave pass-through
   frames and coded blocks without negotiation.
 - `fixed` — constant `fixed_overhead_pct` redundancy, always on.
-- `crosspath` — code erasure blocks across all WANs to survive a whole-WAN
-  loss (costs capacity). **Requires `scheduler.affinity: packet`. Not
-  implemented until M4.**
+- `crosspath` — code erasure blocks across **all** WANs: the sender spreads
+  each block's frames over every live path (smooth weighted round-robin), so
+  a whole-WAN failure costs only its share of every block — recoverable via
+  the parity when the redundancy covers it. **Requires
+  `scheduler.affinity: packet`.** Costs capacity proportional to
+  `protection_level`: 1.0 survives losing one whole WAN in a 2-WAN setup
+  (2× wire traffic); 0.5 → ≥ ceil(k·0.5) parity per block (survives one of
+  three WANs). Coding is always ON in this mode (pass-through would make a
+  WAN loss unrecoverable); parity may grow further with measured loss.
+  `protection_level` default: 0.5. **Implemented since M4.1.**
 - `data_shards` — block size. When coding is active, sparse traffic (games
   ~50–200 pps) rarely fills a 10-frame block within `block_timeout_ms`, so
   blocks flush short without parity and FEC stays idle. For interactive

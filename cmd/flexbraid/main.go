@@ -24,7 +24,7 @@ import (
 	"github.com/ColinFL/flexbraid/internal/tunnel"
 )
 
-var version = "0.1.0-m3"
+var version = "0.1.0-m4"
 
 func main() {
 	cfgPath := flag.String("c", "config.yaml", "path to YAML config file")

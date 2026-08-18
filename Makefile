@@ -1,6 +1,6 @@
 # FlexBraid build helpers.
 BINARY   := flexbraid
-VERSION  ?= 0.1.0-m3
+VERSION  ?= 0.1.0-m4
 LDFLAGS  := -s -w -X main.version=$(VERSION)
 
 .PHONY: all build test vet fmt clean cross

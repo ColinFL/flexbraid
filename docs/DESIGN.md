@@ -294,9 +294,9 @@ parity sub-header + frame header + AEAD tag, and it must fit the path MTU
 without IP fragmentation (a lost fragment would defeat FEC entirely):
 ```
 inner_mtu = min_path_mtu − frame_header(28) − auth_tag(16) − parity_subheader(k)
-parity_subheader(k) = 6 + 4k + 2k      # k = data shards (default 10 → 66 B)
+parity_subheader(k) = 8 + 4k + 2k      # k = data shards (default 10 → 68 B)
 ```
-- On a 1500-byte path with k=10: `1500 − 44 − 66 = 1390`. With FEC off the
+- On a 1500-byte path with k=10: `1500 − 44 − 68 = 1388`. With FEC off the
   parity sub-header disappears: `1500 − 44 = 1456` (1420 stays a safe default).
 - **M2 status:** enforced at startup — config validation rejects an `mtu` whose
   parity frames would exceed the 1500-byte path MTU, and oversized inner
@@ -346,10 +346,14 @@ This is the "minimal loss, no load splitting" profile.
 Within-path FEC is coherent only when a block stays on one path. Enforcement:
 - `affinity: flow` → **per-WAN FEC blocks** (data + parity on the same path).
   Always coherent.
-- `affinity: packet` → per-WAN FEC is meaningless; use **cross-path FEC**
-  (§6.4) instead.
+- `affinity: packet` + `fec.mode: crosspath` → blocks are **spread across
+  paths by design** (smooth weighted round-robin, §6.4); the receiver keys
+  blocks by session, so per-frame path choice is invisible to reassembly.
+- `affinity: packet` + per-WAN FEC → per-WAN FEC is meaningless; use
+  **cross-path FEC** (§6.4) instead.
 The scheduler never splits a per-WAN FEC block across paths — it hands complete
-blocks to the chosen WAN's encoder.
+blocks to the chosen WAN's encoder. Cross-path mode is the explicit exception:
+it hands *individual frames* of a block to the WRR picker.
 
 ### 7.5 Graceful drain
 Before a degraded WAN is disabled, stop scheduling new flows onto it and let
@@ -550,9 +554,10 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
   EWMA monitoring, circuit breaker with in-band loss telemetry + silence
   watchdog, delivery buffer (reorder+jitter, configurable window), per-WAN
   socket binding (`iface`/`local_ip`). Per-WAN queues/rate-limit moved to M5.
-- **M4 — Multi-WAN resilience:** warm standby failover, cross-path FEC
-  (optional), FakeTCP + ICMP transports, adaptive FEC (live redundancy
-  adjustment from measured loss).
+- **M4 — Multi-WAN resilience:** *(M4.1 cross-path FEC done)* — blocks
+  spread across all WANs (smooth WRR), parity floor via `protection_level`,
+  whole-WAN loss survivable at capacity cost. Remaining: FakeTCP + ICMP
+  transports, adaptive FEC (live redundancy adjustment from measured loss).
 - **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging, docs
   site, authenticated key-exchange (forward secrecy).
 
