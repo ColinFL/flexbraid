@@ -3,7 +3,6 @@
 package transport
 
 import (
-	"bytes"
 	"errors"
 	"net"
 	"testing"
@@ -13,7 +12,7 @@ import (
 // TestFakeTCPLoopback runs a full client↔server exchange over the loopback
 // interface with real raw sockets: SYN+data → SYN|ACK+data → PSH|ACK, then
 // several data round trips. Requires root/CAP_NET_RAW — skipped otherwise
-// (GitHub runners run unprivileged).
+// (GitHub runners run unprivileged; CI runs it in a NET_RAW container).
 func TestFakeTCPLoopback(t *testing.T) {
 	const srvPort = 39999
 
@@ -32,47 +31,38 @@ func TestFakeTCPLoopback(t *testing.T) {
 	defer cli.Close()
 	defer srv.Close()
 
-	// Server recv loop.
-	recvCh := make(chan []byte, 4)
-	addrCh := make(chan net.Addr, 4)
-	errCh := make(chan error, 1)
+	// Recv loops for both ends.
+	srvRecvCh := make(chan []byte, 8)
+	srvAddrCh := make(chan net.Addr, 8)
+	srvErrCh := make(chan error, 1)
 	go func() {
 		for {
 			b, addr, err := srv.Recv()
 			if err != nil {
-				errCh <- err
+				srvErrCh <- err
 				return
 			}
-			recvCh <- b
-			addrCh <- addr
+			srvRecvCh <- b
+			srvAddrCh <- addr
+		}
+	}()
+	cliRecvCh := make(chan []byte, 8)
+	cliErrCh := make(chan error, 1)
+	go func() {
+		for {
+			b, _, err := cli.Recv()
+			if err != nil {
+				cliErrCh <- err
+				return
+			}
+			cliRecvCh <- b
 		}
 	}()
 
-	// 1. Client sends FIRST (SYN + data) — 0-RTT fake handshake.
-	if err := cli.Send([]byte("first")); err != nil {
-		t.Fatalf("client send: %v", err)
-	}
-	var srvAddr net.Addr
-	select {
-	case b := <-recvCh:
-		if string(b) != "first" {
-			t.Fatalf("server got %q, want first", b)
-		}
-		srvAddr = <-addrCh
-	case err := <-errCh:
-		t.Fatalf("server recv: %v", err)
-	case <-time.After(3 * time.Second):
-		t.Fatal("server did not receive the first segment")
-	}
-
-	// 2. Server replies (SYN|ACK + data).
-	if err := srv.SendTo(srvAddr, []byte("pong")); err != nil {
-		t.Fatalf("server send: %v", err)
-	}
-	assertRecv := func(want string) {
+	recvFrom := func(ch chan []byte, errCh chan error, want string) {
 		t.Helper()
 		select {
-		case b := <-recvCh:
+		case b := <-ch:
 			if string(b) != want {
 				t.Fatalf("got %q, want %q", b, want)
 			}
@@ -82,30 +72,41 @@ func TestFakeTCPLoopback(t *testing.T) {
 			t.Fatalf("did not receive %q", want)
 		}
 	}
-	assertRecv("pong")
 
-	// 3. Subsequent data round trips (PSH|ACK phase both ways).
+	// 1. Client sends FIRST (SYN + data) — 0-RTT fake handshake.
+	if err := cli.Send([]byte("first")); err != nil {
+		t.Fatalf("client send: %v", err)
+	}
+	var srvAddr net.Addr
+	select {
+	case b := <-srvRecvCh:
+		if string(b) != "first" {
+			t.Fatalf("server got %q, want first", b)
+		}
+		srvAddr = <-srvAddrCh
+	case err := <-srvErrCh:
+		t.Fatalf("server recv: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not receive the first segment")
+	}
+
+	// 2. Server replies (SYN|ACK + data) — the client must get it.
+	if err := srv.SendTo(srvAddr, []byte("pong")); err != nil {
+		t.Fatalf("server send: %v", err)
+	}
+	recvFrom(cliRecvCh, cliErrCh, "pong")
+
+	// 3. Data round trips (PSH|ACK phase both ways).
 	for i := 0; i < 5; i++ {
 		msg := []byte{byte('a' + i), byte(i)}
 		if err := cli.Send(msg); err != nil {
 			t.Fatalf("client send %d: %v", i, err)
 		}
-		select {
-		case b := <-recvCh:
-			if !bytes.Equal(b, msg) {
-				t.Fatalf("server got %v, want %v", b, msg)
-			}
-		case err := <-errCh:
-			t.Fatalf("server recv %d: %v", i, err)
-		case <-time.After(3 * time.Second):
-			t.Fatalf("server missed round trip %d", i)
-		}
+		recvFrom(srvRecvCh, srvErrCh, string(msg))
 		reply := []byte{0xff, byte(i)}
 		if err := srv.SendTo(srvAddr, reply); err != nil {
 			t.Fatalf("server send %d: %v", i, err)
 		}
-	}
-	for i := 0; i < 5; i++ {
-		assertRecv(string([]byte{0xff, byte(i)}))
+		recvFrom(cliRecvCh, cliErrCh, string(reply))
 	}
 }
