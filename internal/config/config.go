@@ -148,6 +148,14 @@ type FEC struct {
 	AdaptMinLossPct float64 `yaml:"adapt_min_loss_pct"` // default 2
 	AdaptResumePct  float64 `yaml:"adapt_resume_pct"`   // default 0.5
 	AdaptHoldSec    float64 `yaml:"adapt_hold_sec"`     // default 10
+
+	// ProtectionLevel (mode: crosspath only) is the redundancy floor as a
+	// fraction of data shards: 0.4 → at least ceil(k·0.4) parity shards per
+	// block regardless of the measured loss, so a whole-WAN failure loses
+	// at most (1 − protection) of every block. 1.0 doubles the wire
+	// traffic and survives the loss of any single WAN in a two-WAN setup.
+	// Default 0.5.
+	ProtectionLevel float64 `yaml:"protection_level"`
 }
 
 // WAN describes one physical uplink / path.
@@ -337,7 +345,12 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("fec.fixed_overhead_pct must be in (0,200], got %v", c.FEC.FixedOverheadPct)
 		}
 		if c.FEC.Mode == FECCrosspath {
-			return fmt.Errorf("fec.mode=crosspath is not implemented until M4")
+			if c.FEC.ProtectionLevel == 0 {
+				c.FEC.ProtectionLevel = 0.5
+			}
+			if c.FEC.ProtectionLevel < 0 || c.FEC.ProtectionLevel > 1 {
+				return fmt.Errorf("fec.protection_level must be in [0,1], got %v", c.FEC.ProtectionLevel)
+			}
 		}
 	}
 

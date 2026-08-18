@@ -579,15 +579,29 @@ func (s *Server) sendToSession(sess *session.ServerSession, frames []*frame.Fram
 	if len(frames) == 0 {
 		return
 	}
-	addr := s.pickPath(sess)
-	if addr == nil {
-		return // no path known yet
+	// Cross-path FEC: each frame of the block goes over a DIFFERENT path
+	// (smooth WRR), so one failed WAN costs only its share of the block.
+	// Per-WAN FEC sends the whole block over the best path as before.
+	var oneAddr *net.UDPAddr
+	cross := s.fecParams.CrossPath
+	if !cross {
+		oneAddr = s.pickPath(sess)
+		if oneAddr == nil {
+			return // no path known yet
+		}
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	for _, f := range frames {
 		if f.HasFlag(frame.FlagFECParity) {
 			f.Seq = sess.NextSeq()
+		}
+		addr := oneAddr
+		if cross {
+			addr = s.pickCrossPath(sess)
+			if addr == nil {
+				continue
+			}
 		}
 		plain, err := f.Encode()
 		if err != nil {
@@ -601,6 +615,22 @@ func (s *Server) sendToSession(sess *session.ServerSession, frames []*frame.Fram
 			s.noteSendErr(err)
 		}
 	}
+}
+
+// pickCrossPath returns the next path of the session for cross-path FEC:
+// smooth WRR per FRAME, so one block's frames spread over all live paths.
+func (s *Server) pickCrossPath(sess *session.ServerSession) *net.UDPAddr {
+	st := s.stateFor(sess.ID)
+	s.statesMu.Lock()
+	defer s.statesMu.Unlock()
+	pk, ok := st.sched.PickWRR()
+	if !ok {
+		return nil
+	}
+	if ps := st.paths[pk]; ps != nil {
+		return ps.addr
+	}
+	return nil
 }
 
 // noteSendErr logs send failures at most every 100th occurrence (P6).

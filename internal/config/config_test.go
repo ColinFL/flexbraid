@@ -118,17 +118,27 @@ func TestAffinityDefaultsToPacket(t *testing.T) {
 }
 
 func TestCrosspathRequiresPacketAffinity(t *testing.T) {
-	// default affinity is flow -> crosspath must be rejected
-	cfg := strings.Replace(sample, "mode: adaptive", "mode: crosspath", 1)
+	// explicit flow affinity -> crosspath must be rejected
+	cfg := strings.Replace(sample, "mode: lb\n  balance_by: capacity", "mode: lb\n  affinity: flow\n  balance_by: capacity", 1)
+	cfg = strings.Replace(cfg, "mode: adaptive", "mode: crosspath", 1)
 	if _, err := loadString(cfg); err == nil {
 		t.Error("expected error: crosspath FEC with flow affinity")
 	}
-	// with packet affinity the affinity check passes, but crosspath itself
-	// is not implemented until M4, so it must still be rejected
+	// with packet affinity crosspath is accepted and gets the default
+	// protection level of 0.5
 	cfg = strings.Replace(sample, "mode: lb\n  balance_by: capacity", "mode: lb\n  affinity: packet\n  balance_by: capacity", 1)
 	cfg = strings.Replace(cfg, "mode: adaptive", "mode: crosspath", 1)
+	c, err := loadString(cfg)
+	if err != nil {
+		t.Fatalf("crosspath with packet affinity must be accepted: %v", err)
+	}
+	if c.FEC.ProtectionLevel != 0.5 {
+		t.Fatalf("protection_level default must be 0.5, got %v", c.FEC.ProtectionLevel)
+	}
+	// out-of-range protection level must be rejected
+	cfg = strings.Replace(sample, "mode: adaptive", "mode: crosspath\n  protection_level: 1.5", 1)
 	if _, err := loadString(cfg); err == nil {
-		t.Fatal("crosspath must be rejected until M4 even with packet affinity")
+		t.Error("expected error: protection_level > 1")
 	}
 }
 

@@ -260,6 +260,53 @@ func adaptiveTestParams(loss float64) Params {
 	}
 }
 
+// TestCrossPathSurvivesWholeWAN is the M4 cross-path guarantee: one block
+// is spread over N paths (smooth WRR), so losing EVERY frame that travelled
+// one whole WAN must still be recoverable when the parity floor covers it
+// (docs/DESIGN.md §6.4). k=8, p=4 over 3 paths: the lost path carries 4 of
+// 12 shards — exactly the RS capacity — and all 8 data frames must arrive.
+func TestCrossPathSurvivesWholeWAN(t *testing.T) {
+	const k, p, n = 8, 4, 3
+	params := Params{
+		DataShards: k, ParityShards: p, BlockTimeout: 8 * time.Millisecond,
+		CrossPath: true, CrossPathMinParity: p,
+	}
+	enc, err := NewEncoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := NewDecoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emitted := encodeAll(t, enc, makeDataFrames(k))
+	if len(emitted) != k+p {
+		t.Fatalf("want %d frames (k+p), got %d", k+p, len(emitted))
+	}
+	// Distribute WRR-style over n paths; the last path dies and its frames
+	// never reach the decoder.
+	paths := []string{"wan1", "wan2", "wan3"}
+	var delivered []*frame.Frame
+	for i, f := range emitted {
+		path := paths[i%n]
+		if path == "wan3" {
+			continue // whole WAN lost
+		}
+		delivered = append(delivered, dec.Push(path, f)...)
+	}
+	delivered = append(delivered, dec.Tick(time.Now().Add(100*time.Millisecond))...)
+	if len(delivered) != k {
+		t.Fatalf("cross-path: want %d data frames after losing one WAN, got %d", k, len(delivered))
+	}
+	seen := make(map[uint32]bool, k)
+	for _, f := range delivered {
+		if f.Seq < 1 || f.Seq > k || seen[f.Seq] {
+			t.Fatalf("bad/duplicate delivered seq %d", f.Seq)
+		}
+		seen[f.Seq] = true
+	}
+}
+
 // TestTakeStreamStats: the decoder accounts unrecovered loss per stream —
 // data frames missing when a block flushes. Recovered blocks count zero.
 func TestTakeStreamStats(t *testing.T) {

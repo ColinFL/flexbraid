@@ -39,18 +39,32 @@ const DefaultDataShards = 10
 
 // Params describes a codec. ParityShards == 0 disables coding.
 //
-// Adaptive, when non-nil, turns the encoder into a live-adaptive FEC (M3.1):
-// while the measured loss of the path stays below Adaptive.OnLossPct the
-// encoder runs pass-through (zero latency, zero overhead); once loss rises
-// above it, coding kicks in with parity sized to the current loss (with
-// safety margin, capped by ParityShards). Adaptive.Hold prevents flapping.
-// Parity frames are self-describing, so the receiver needs no negotiation
-// and mixed blocks/pass-through interleave safely.
+// Adaptive, when non-nil, turns the encoder into a live-adaptive FEC: while
+// the measured loss of the path stays below Adaptive.OnLossPct the encoder
+// runs pass-through (zero latency, zero overhead); once loss rises above it,
+// coding kicks in with parity sized to the current loss (with safety margin,
+// capped by ParityShards). Adaptive.Hold prevents flapping. Parity frames are
+// self-describing (they carry the block's actual parity count), so the
+// receiver needs no negotiation and mixed blocks/pass-through interleave
+// safely.
+//
+// CrossPath codes erasure blocks across ALL WANs (design §6.4): the block's
+// frames are distributed over every live path, so a whole-WAN failure loses
+// only a fraction of each block — recoverable when the redundancy covers it.
+// CrossPath forces coding always (pass-through would lose whole-WAN traffic
+// unrecoverably) and CrossPathMinParity guarantees the redundancy needed to
+// survive one failed path (ceil(k/(N−1)) for N paths).
 type Params struct {
 	DataShards   int
 	ParityShards int
 	BlockTimeout time.Duration
 	Adaptive     *AdaptiveParams // nil = always code (fixed mode)
+	// CrossPath codes each block across all WANs instead of one. Requires
+	// the sender to distribute the block's frames over the paths.
+	CrossPath bool
+	// CrossPathMinParity is the minimum parity shards per block in
+	// cross-path mode (survive-one-path floor); 0 = no floor.
+	CrossPathMinParity int
 }
 
 // AdaptiveParams tunes live-adaptive FEC (Params.Adaptive).
@@ -75,11 +89,14 @@ func (p Params) Enabled() bool { return p.ParityShards > 0 }
 //	[0:2]   u16 k            — number of data frames in the block
 //	[2:4]   u16 parity index — position of this shard in the parity list
 //	[4:6]   u16 max_len      — padded shard size (bytes)
-//	[6:6+4k]     k × u32     — data seqs of the block, in order
-//	[6+4k:6+6k]  k × u16     — original payload length of each data frame
-//	[6+6k:]       max_len    — the parity shard itself
+//	[6:8]   u16 p            — total parity shards in THIS block (dynamic:
+//	                          live-adaptive FEC sizes it to the path loss,
+//	                          so the receiver must not assume a fixed n)
+//	[8:8+4k]     k × u32     — data seqs of the block, in order
+//	[8+4k:8+6k]  k × u16     — original payload length of each data frame
+//	[8+6k:]       max_len    — the parity shard itself
 const (
-	parityHdrFixed = 6
+	parityHdrFixed = 8
 )
 
 // ParityHeaderSize returns the byte size of the self-describing parity
@@ -122,7 +139,7 @@ func NewEncoder(p Params) (*Encoder, error) {
 	if p.BlockTimeout <= 0 {
 		p.BlockTimeout = 8 * time.Millisecond
 	}
-	e := &Encoder{params: p, codingOn: p.Adaptive == nil, rsParity: p.ParityShards}
+	e := &Encoder{params: p, codingOn: p.Adaptive == nil || p.CrossPath, rsParity: p.ParityShards}
 	if p.Enabled() {
 		var err error
 		e.rs, err = reedsolomon.New(p.DataShards, p.ParityShards)
@@ -154,10 +171,15 @@ func (e *Encoder) SetLossRate(rate float64) {
 }
 
 // refreshLocked re-evaluates the code/pass-through decision and rebuilds
-// the RS encoder when the required redundancy changed.
+// the RS encoder when the required redundancy changed. Cross-path FEC codes
+// always: pass-through would lose a whole-WAN share of every block with no
+// chance of recovery.
 func (e *Encoder) refreshLocked(now time.Time) {
-	if e.params.Adaptive == nil {
+	if e.params.Adaptive == nil || e.params.CrossPath {
 		e.codingOn = true
+		if e.params.CrossPath {
+			e.rebuildLocked(now)
+		}
 		return
 	}
 	a := e.params.Adaptive
@@ -171,37 +193,54 @@ func (e *Encoder) refreshLocked(now time.Time) {
 		e.codingOn = false
 	}
 	if e.codingOn {
-		parity := e.parityForLoss(e.lossRate)
-		if parity != e.rsParity {
-			rs, err := reedsolomon.New(e.params.DataShards, parity)
-			if err != nil {
-				return // keep the old encoder; sizing is best-effort
-			}
-			e.rs = rs
-			e.rsParity = parity
+		e.rebuildLocked(now)
+	}
+}
+
+// rebuildLocked rebuilds the RS encoder when the required redundancy
+// changed from the current loss estimate.
+func (e *Encoder) rebuildLocked(now time.Time) {
+	parity := e.parityForLoss(e.lossRate)
+	if parity != e.rsParity {
+		rs, err := reedsolomon.New(e.params.DataShards, parity)
+		if err != nil {
+			return // keep the old encoder; sizing is best-effort
 		}
+		e.rs = rs
+		e.rsParity = parity
 	}
 }
 
 // parityForLoss sizes the redundancy for the current loss: the theoretical
 // L/(1−L) times the safety margin, capped by the configured ceiling
-// (max_loss_pct) and the RS field bound (data+parity ≤ 256).
+// (max_loss_pct) and the RS field bound (data+parity ≤ 256). In cross-path
+// mode CrossPathMinParity is the floor — surviving one failed path takes
+// precedence over the overhead ceiling.
 func (e *Encoder) parityForLoss(loss float64) int {
 	a := e.params.Adaptive
 	k := e.params.DataShards
-	target := loss / (1 - loss) * a.Safety
-	capLoss := a.MaxLossPct / 100.0
-	if cap := capLoss / (1 - capLoss); target > cap {
-		target = cap
+	target := 0.0
+	if a != nil {
+		// Live-adaptive sizing: theoretical L/(1−L) × safety margin,
+		// capped by the configured ceiling (max_loss_pct). Without an
+		// adaptive spec (fixed / cross-path) the floor applies as-is.
+		target = loss / (1 - loss) * a.Safety
+		capLoss := a.MaxLossPct / 100.0
+		if cap := capLoss / (1 - capLoss); target > cap {
+			target = cap
+		}
 	}
 	parity := int(math.Ceil(float64(k) * target))
 	if parity < 1 {
 		parity = 1
 	}
+	if e.params.CrossPathMinParity > parity {
+		parity = e.params.CrossPathMinParity
+	}
 	if k+parity > 256 {
 		parity = 256 - k
 	}
-	if parity > e.params.ParityShards {
+	if !e.params.CrossPath && parity > e.params.ParityShards {
 		parity = e.params.ParityShards
 	}
 	return parity
@@ -314,6 +353,7 @@ func (e *Encoder) emitBlock() []*frame.Frame {
 	}
 	sub := make([]byte, ParityHeaderSize(e.params.DataShards)+maxLen)
 	binary.BigEndian.PutUint16(sub[0:2], uint16(e.params.DataShards))
+	binary.BigEndian.PutUint16(sub[6:8], uint16(parity))
 	for i, f := range data {
 		binary.BigEndian.PutUint32(sub[parityHdrFixed+4*i:], f.Seq)
 	}
@@ -354,6 +394,7 @@ type blockKey struct {
 // blockState is the decoder's per-block assembly buffer.
 type blockState struct {
 	k        int
+	p        int      // total parity shards in this block (from sub-header)
 	seqs     []uint32 // data seqs in order (from the first parity frame)
 	lens     []uint16 // original payload lengths
 	maxLen   int
@@ -379,8 +420,11 @@ type streamStat struct {
 type Decoder struct {
 	mu     sync.Mutex
 	params Params
-	rs     reedsolomon.Encoder
 	blocks map[blockKey]*blockState
+	// rsByParity caches RS encoders per (k, p) — live-adaptive and
+	// cross-path FEC emit blocks with a dynamic parity count, and the
+	// codec is rebuilt for each distinct n.
+	rsByParity map[int]reedsolomon.Encoder
 	// lastFlushed tracks the highest flushed block_seq per session so that
 	// frames arriving after their block was delivered (reconstructed or
 	// flushed on timeout) cannot create phantom blocks and duplicate
@@ -388,6 +432,19 @@ type Decoder struct {
 	lastFlushed map[streamKey]uint32
 	// stats accumulates per-stream loss counters for TakeStreamStats.
 	stats map[streamKey]streamStat
+}
+
+// rsFor returns (caching) an RS encoder for the block's actual shard count.
+func (d *Decoder) rsFor(k, p int) reedsolomon.Encoder {
+	if rs, ok := d.rsByParity[p]; ok {
+		return rs
+	}
+	rs, err := reedsolomon.New(k, p)
+	if err != nil {
+		return nil
+	}
+	d.rsByParity[p] = rs
+	return rs
 }
 
 // NewDecoder builds a decoder for the given params.
@@ -398,15 +455,8 @@ func NewDecoder(p Params) (*Decoder, error) {
 	if p.BlockTimeout <= 0 {
 		p.BlockTimeout = 8 * time.Millisecond
 	}
-	var rs reedsolomon.Encoder
-	if p.Enabled() {
-		var err error
-		rs, err = reedsolomon.New(p.DataShards, p.ParityShards)
-		if err != nil {
-			return nil, fmt.Errorf("fec: rs.New(%d,%d): %w", p.DataShards, p.ParityShards, err)
-		}
-	}
-	return &Decoder{params: p, rs: rs, blocks: make(map[blockKey]*blockState),
+	return &Decoder{params: p, blocks: make(map[blockKey]*blockState),
+		rsByParity:  make(map[int]reedsolomon.Encoder),
 		lastFlushed: make(map[streamKey]uint32), stats: make(map[streamKey]streamStat)}, nil
 }
 
@@ -414,7 +464,8 @@ func NewDecoder(p Params) (*Decoder, error) {
 // any data frames that can now be delivered (in seq order). Frames of an
 // already-flushed block are dropped. The path identifies the WAN the frame
 // arrived on (M3): blocks are per-path, so two WANs' block sequences never
-// collide.
+// collide — except in cross-path mode, where a block's frames arrive
+// interleaved over every WAN and the block is keyed by session only.
 func (d *Decoder) Push(path string, f *frame.Frame) []*frame.Frame {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -434,10 +485,14 @@ func (d *Decoder) Push(path string, f *frame.Frame) []*frame.Frame {
 	if !f.HasFlag(frame.FlagFECParity) && f.BlockSeq == 0 {
 		return []*frame.Frame{f}
 	}
-	key := blockKey{sessionID: f.SessionID, path: path, blockSeq: f.BlockSeq}
+	sp := path
+	if d.params.CrossPath {
+		sp = "" // cross-path blocks span all WANs
+	}
+	key := blockKey{sessionID: f.SessionID, path: sp, blockSeq: f.BlockSeq}
 	st := d.blocks[key]
 	if st == nil {
-		sk := streamKey{sessionID: f.SessionID, path: path}
+		sk := streamKey{sessionID: f.SessionID, path: sp}
 		if d.lastFlushed[sk] >= key.blockSeq {
 			return nil // block already delivered; late/duplicate frame
 		}
@@ -462,9 +517,9 @@ func (d *Decoder) Push(path string, f *frame.Frame) []*frame.Frame {
 		}
 		if _, dup := st.data[f.Seq]; !dup {
 			st.data[f.Seq] = f.Payload
-			s := d.stats[streamKey{sessionID: f.SessionID, path: path}]
+			s := d.stats[streamKey{sessionID: f.SessionID, path: sp}]
 			s.received++
-			d.stats[streamKey{sessionID: f.SessionID, path: path}] = s
+			d.stats[streamKey{sessionID: f.SessionID, path: sp}] = s
 		}
 	}
 	return d.maybeDeliver(key, st)
@@ -517,12 +572,14 @@ func (d *Decoder) addParity(st *blockState, f *frame.Frame) error {
 	k := int(binary.BigEndian.Uint16(f.Payload[0:2]))
 	pidx := int(binary.BigEndian.Uint16(f.Payload[2:4]))
 	maxLen := int(binary.BigEndian.Uint16(f.Payload[4:6]))
+	p := int(binary.BigEndian.Uint16(f.Payload[6:8]))
 	need := parityHdrFixed + 4*k + 2*k + maxLen
 	if len(f.Payload) < need {
 		return errors.New("fec: parity payload truncated")
 	}
 	if st.k == 0 {
 		st.k = k
+		st.p = p
 		st.maxLen = maxLen
 		st.seqs = make([]uint32, k)
 		st.lens = make([]uint16, k)
@@ -543,9 +600,17 @@ func (d *Decoder) addParity(st *blockState, f *frame.Frame) error {
 	return nil
 }
 
-// reconstruct fills missing data shards via RS and emits the block.
+// reconstruct fills missing data shards via RS and emits the block. The RS
+// codec is built for the block's ACTUAL shard count (k + p from the parity
+// sub-header): live-adaptive and cross-path FEC emit blocks with a dynamic
+// parity count, and reconstructing against the configured ceiling would
+// fail whenever the block carried fewer parity shards than the maximum.
 func (d *Decoder) reconstruct(key blockKey, st *blockState) []*frame.Frame {
-	n := st.k + d.params.ParityShards
+	n := st.k + st.p
+	rs := d.rsFor(st.k, st.p)
+	if rs == nil {
+		return nil
+	}
 	shards := make([][]byte, n)
 	for i, seq := range st.seqs {
 		if payload, ok := st.data[seq]; ok {
@@ -558,7 +623,7 @@ func (d *Decoder) reconstruct(key blockKey, st *blockState) []*frame.Frame {
 			shards[st.k+pidx] = shard
 		}
 	}
-	if err := d.rs.Reconstruct(shards); err != nil {
+	if err := rs.Reconstruct(shards); err != nil {
 		// Not enough shards after all — deliver what we have on timeout.
 		return nil
 	}

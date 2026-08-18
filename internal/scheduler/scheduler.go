@@ -19,7 +19,8 @@
 //
 // The FEC×scheduler coupling invariant (§7.4): the server hands *complete
 // blocks* to the scheduler, never individual frames of a block, so per-WAN
-// FEC stays coherent.
+// FEC stays coherent. Cross-path FEC (§6.4) is the explicit exception —
+// PickWRR spreads one block's frames over every live path.
 package scheduler
 
 import (
@@ -63,6 +64,7 @@ type path struct {
 	capacity float64 // effective capacity (mbps, FEC-overhead-adjusted)
 	state    health.State
 	loss     float64
+	rr       float64 // smooth-WRR accumulator (cross-path FEC, packet affinity)
 }
 
 // Scheduler is concurrency-safe.
@@ -165,6 +167,37 @@ func (s *Scheduler) Pick(f *frame.Frame) (string, bool) {
 		}
 	}
 	return s.pickWeightedLocked(usable), true
+}
+
+// PickWRR returns the next WAN for cross-path FEC (docs/DESIGN.md §6.4):
+// the frames of one block are spread across ALL usable WANs, so a
+// whole-WAN failure costs only its share of each block — recoverable when
+// the cross-path redundancy covers it. Smooth weighted round-robin: each
+// path accumulates its weight and the max is picked, which interleaves the
+// paths proportionally to capacity while guaranteeing the same path is
+// never chosen twice in a row while another usable path exists.
+func (s *Scheduler) PickWRR() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	usable := s.usableLocked()
+	if len(usable) == 0 {
+		return "", false
+	}
+	total := 0.0
+	best := usable[0]
+	for _, p := range usable {
+		w := s.weightLocked(p)
+		p.rr += w
+		total += w
+		if p.rr > best.rr {
+			best = p
+		}
+	}
+	if total <= 0 {
+		return best.id, true // all zero-weight (degraded-only): drain in order
+	}
+	best.rr -= total
+	return best.id, true
 }
 
 // Healthy reports whether at least one WAN is usable.

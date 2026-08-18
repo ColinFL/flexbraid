@@ -110,6 +110,14 @@ type Client struct {
 
 	probeInterval time.Duration
 
+	// Cross-path FEC (fec.mode: crosspath): ONE codec shared by every WAN;
+	// blocks are spread across all usable paths (scheduler.PickWRR) and the
+	// decoder keys them by session only, so frames from different paths
+	// assemble into the same block (docs/DESIGN.md §6.4).
+	crossPath bool
+	xenc      *fec.Encoder
+	xdec      *fec.Decoder
+
 	// sendErrs throttles repeated send-failure logging (P6).
 	sendErrs atomic.Uint64
 	// oversizeErrs throttles MTU-exceeded logging (P6).
@@ -136,8 +144,27 @@ func fecParamsFor(cfg *config.Config, wan *config.WAN) (fec.Params, error) {
 		return fec.Params{BlockTimeout: timeout}, nil
 	}
 	if f.Mode == config.FECCrosspath {
-		return fec.Params{}, fmt.Errorf("fec.mode %q is not implemented until M4 (requires scheduler.affinity: packet)",
-			config.FECCrosspath)
+		// Cross-path FEC (docs/DESIGN.md §6.4): one codec shared by all
+		// WANs, blocks spread across every usable path, so a whole-WAN
+		// failure loses only its share of each block — recoverable when
+		// the redundancy covers it. Parity is floored by protection_level
+		// (coding is always ON: pass-through would make a WAN loss
+		// unrecoverable) and may grow with measured loss on top.
+		k := fec.DefaultDataShards
+		if f.DataShards > 0 {
+			k = f.DataShards
+		}
+		minParity := int(math.Ceil(float64(k) * f.ProtectionLevel))
+		if minParity < 1 {
+			minParity = 1
+		}
+		return fec.Params{
+			DataShards:         k,
+			ParityShards:       minParity,
+			BlockTimeout:       timeout,
+			CrossPath:          true,
+			CrossPathMinParity: minParity,
+		}, nil
 	}
 	k := fec.DefaultDataShards
 	if f.DataShards > 0 {
@@ -304,6 +331,22 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		sched:         scheduler.New(schedulerOptions(cfg)),
 		probeInterval: probeInterval,
 	}
+	// Cross-path FEC shares one codec across all WANs (blocks span every
+	// path; per-WAN codecs would never see a full block). Per-WAN FEC
+	// (adaptive/fixed) keeps one codec per WAN.
+	if cfg.FEC.Mode == config.FECCrosspath {
+		c.crossPath = true
+		xparams, err := fecParamsFor(cfg, &cfg.WANs[0]) // wan-independent in cross-path mode
+		if err != nil {
+			return nil, err
+		}
+		if c.xenc, err = fec.NewEncoder(xparams); err != nil {
+			return nil, fmt.Errorf("cross-path fec encoder: %w", err)
+		}
+		if c.xdec, err = fec.NewDecoder(xparams); err != nil {
+			return nil, fmt.Errorf("cross-path fec decoder: %w", err)
+		}
+	}
 	// Per-WAN transports, FEC codecs and health monitors.
 	for i := range cfg.WANs {
 		wcfg := &cfg.WANs[i]
@@ -311,13 +354,16 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		enc, err := fec.NewEncoder(params)
-		if err != nil {
-			return nil, fmt.Errorf("wan %s fec encoder: %w", wcfg.ID, err)
-		}
-		dec, err := fec.NewDecoder(params)
-		if err != nil {
-			return nil, fmt.Errorf("wan %s fec decoder: %w", wcfg.ID, err)
+		enc, dec := (*fec.Encoder)(nil), (*fec.Decoder)(nil)
+		if c.crossPath {
+			enc, dec = c.xenc, c.xdec
+		} else {
+			if enc, err = fec.NewEncoder(params); err != nil {
+				return nil, fmt.Errorf("wan %s fec encoder: %w", wcfg.ID, err)
+			}
+			if dec, err = fec.NewDecoder(params); err != nil {
+				return nil, fmt.Errorf("wan %s fec decoder: %w", wcfg.ID, err)
+			}
 		}
 		mon := health.New(healthOptions(cfg.Health, fecCompensableLoss(params), probeInterval))
 		wan := &wanLink{
@@ -600,6 +646,28 @@ func (c *Client) sendEncoded(wan *wanLink, frames []*frame.Frame) {
 	}
 }
 
+// sendCrossEncoded spreads one cross-path block over all usable WANs
+// (smooth WRR): a whole-WAN failure then costs only its share of each
+// block — recoverable when the cross-path parity covers it. Unlike
+// sendEncoded there is no single sendMu: each frame takes its own WAN's
+// lock, so frames of one block leave concurrently over different links.
+func (c *Client) sendCrossEncoded(frames []*frame.Frame) {
+	for _, f := range frames {
+		if f.HasFlag(frame.FlagFECParity) {
+			f.Seq = c.sess.NextSeq()
+		}
+		wanID, ok := c.sched.PickWRR()
+		if !ok {
+			c.noteNoWAN()
+			continue
+		}
+		wan := c.byWAN[wanID]
+		wan.sendMu.Lock()
+		c.sendLocked(wan, f, c.sessAEAD)
+		wan.sendMu.Unlock()
+	}
+}
+
 // noteSendErr throttles repeated send-failure logging (P6): warn on the
 // first failure, then every 100th.
 func (c *Client) noteSendErr(err error) {
@@ -663,6 +731,16 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 			SessionID: uint64(c.sess.ID),
 			Seq:       c.sess.NextSeq(), // before Push: sub-header records true seqs
 			Payload:   payload,
+		}
+		if c.crossPath {
+			// Cross-path FEC: code the block globally, then spread its
+			// frames over every usable WAN (smooth WRR). Blocks are keyed
+			// by session on the receiver, so the WAN a frame travelled is
+			// irrelevant to reassembly — only the surviving share matters.
+			if frames := c.xenc.Push(f); len(frames) > 0 {
+				c.sendCrossEncoded(frames)
+			}
+			continue
 		}
 		wanID, ok := c.sched.Pick(f)
 		if !ok {
@@ -729,6 +807,12 @@ func (c *Client) fecTickLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
+			if c.crossPath {
+				// One shared codec: single flush for encoder and decoder.
+				c.sendCrossEncoded(c.xenc.Tick(now))
+				c.deliverToWG(c.delivery.Push(c.xdec.Tick(now)))
+				continue
+			}
 			for _, wan := range c.wans {
 				c.sendEncoded(wan, wan.enc.Tick(now))
 				c.deliverToWG(c.delivery.Push(wan.dec.Tick(now)))

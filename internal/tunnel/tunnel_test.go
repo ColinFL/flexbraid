@@ -112,10 +112,10 @@ func startTestPairWrapped(t *testing.T, psk string, fecCfg *config.FEC, wrap fun
 		Crypto: config.Crypto{Key: psk, Cipher: "chacha20poly1305"},
 	}
 	// With FEC on, the largest parity frame must fit the 1500-byte path MTU
-	// (P2): inner MTU 1390 = 1500 − 28 (frame hdr) − 16 (AEAD) − 66 (parity
+	// (P2): inner MTU 1388 = 1500 − 28 (frame hdr) − 16 (AEAD) − 68 (parity
 	// sub-header, k=10). Config validation rejects anything larger.
 	if fecOpt.Enabled {
-		srvCfg.MTU = 1390
+		srvCfg.MTU = 1388
 	}
 	srv, err = NewServer(srvCfg, log)
 	if err != nil {
@@ -139,7 +139,7 @@ func startTestPairWrapped(t *testing.T, psk string, fecCfg *config.FEC, wrap fun
 		}},
 	}
 	if fecOpt.Enabled {
-		cliCfg.MTU = 1390
+		cliCfg.MTU = 1388
 	}
 	cli, err = NewClient(cliCfg, log)
 	if err != nil {
@@ -452,8 +452,8 @@ func TestMTUValidationRejectsOversizedInnerMTU(t *testing.T) {
 	if _, err := NewClient(base(1420), testLogger()); err == nil {
 		t.Fatal("MTU 1420 with FEC must be rejected (parity frames exceed path MTU)")
 	}
-	if _, err := NewClient(base(1390), testLogger()); err != nil {
-		t.Fatalf("MTU 1390 with FEC must be accepted: %v", err)
+	if _, err := NewClient(base(1388), testLogger()); err != nil {
+		t.Fatalf("MTU 1388 with FEC must be accepted: %v", err)
 	}
 }
 
@@ -650,6 +650,109 @@ func TestMultiWANFailover(t *testing.T) {
 	waitFor(t, "wan2 restored", func() bool { return cli.byWAN["w2"].framesSent.Load() > frozen }, 30*time.Second)
 }
 
+// TestCrossPathSurvivesWANLoss is the M4 end-to-end guarantee
+// (docs/DESIGN.md §6.4): with fec.mode=crosspath and protection_level=1.0
+// over 2 WANs, killing one whole WAN must not lose a single inner
+// datagram — each block keeps half its shards on the survivor, exactly
+// the RS limit (k=p=10), and the dead WAN leaves rotation afterwards.
+func TestCrossPathSurvivesWANLoss(t *testing.T) {
+	log := testLogger()
+	fakeWG, err := net.ListenUDP("udp", mustUDPAddr(t, "127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("fake wg listen: %v", err)
+	}
+	t.Cleanup(func() { fakeWG.Close() })
+
+	const psk = "cross-psk"
+	xFEC := config.FEC{
+		Enabled: true, Mode: config.FECCrosspath,
+		DataShards: 10, ProtectionLevel: 1.0, BlockTimeoutMS: 8,
+	}
+	sched := config.Sched{Mode: config.SchedulerLB, BalanceBy: config.BalanceByCapacity, Affinity: config.AffinityPacket}
+
+	srvCfg := &config.Config{
+		Mode: config.ModeServer, Listen: "127.0.0.1:0", WGPeer: fakeWG.LocalAddr().String(),
+		FEC: xFEC, Crypto: config.Crypto{Key: psk, Cipher: "chacha20poly1305"},
+		MTU: 1388, Scheduler: sched,
+	}
+	srv, err := NewServer(srvCfg, log)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Run(ctx) }()
+
+	cliCfg := &config.Config{
+		Mode: config.ModeClient, Listen: "127.0.0.1:0", Server: srv.LocalAddr().String(),
+		FEC: xFEC, Crypto: config.Crypto{Key: psk, Cipher: "chacha20poly1305"},
+		MTU: 1388, Scheduler: sched,
+	}
+	for i := 1; i <= 2; i++ {
+		cliCfg.WANs = append(cliCfg.WANs, config.WAN{
+			ID: fmt.Sprintf("w%d", i), Transport: config.TransportUDP, CapacityMbps: 100,
+		})
+	}
+	cli, err := NewClient(cliCfg, log)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	var killable []*lossyTransport
+	for _, wan := range cli.wans {
+		kw := &lossyTransport{}
+		kw.inner = wan.tr
+		wan.tr = kw
+		killable = append(killable, kw)
+	}
+	if err := cli.Start(); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	go func() { _ = cli.Run(ctx) }()
+
+	wgClient, err := net.ListenUDP("udp", mustUDPAddr(t, "127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("wg client listen: %v", err)
+	}
+	t.Cleanup(func() { wgClient.Close() })
+
+	waitFor(t, "server session", func() bool { return srv.mgr.Count() == 1 }, 3*time.Second)
+	sendUntilReceived(t, wgClient, cli.LocalAddr(), fakeWG, []byte("warmup"), 6*time.Second)
+
+	// Kill WAN 2: every frame that ever goes down that uplink is swallowed.
+	killable[1].killAll.Store(true)
+
+	// Burst after the failure: every unique ping must still arrive — the
+	// cross-path parity reconstructs the half-block lost on the dead WAN.
+	const n = 60
+	sent := make(map[string]bool)
+	got := make(map[string]bool)
+	buf := make([]byte, 65535)
+	deadline := time.Now().Add(15 * time.Second)
+	for len(got) < n && time.Now().Before(deadline) {
+		for i := 0; i < n; i++ {
+			p := fmt.Sprintf("x%02d", i)
+			if !got[p] && !sent[p] {
+				if _, err := wgClient.WriteToUDP([]byte(p), cli.LocalAddr()); err == nil {
+					sent[p] = true
+				}
+			}
+		}
+		_ = fakeWG.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if nn, _, err := fakeWG.ReadFromUDP(buf); err == nil {
+			got[string(buf[:nn])] = true
+		}
+	}
+	if len(got) != n {
+		t.Fatalf("cross-path: only %d/%d pings arrived after a whole WAN died", len(got), n)
+	}
+	// The dead WAN must eventually leave rotation (silence watchdog), so
+	// the survivor carries everything afterwards.
+	waitFor(t, "wan2 DOWN", func() bool { return cli.byWAN["w2"].health.State() == health.StateDown }, 20*time.Second)
+}
+
 // TestParityFrameFitsPathMTU pins the P2 MTU math: the largest frame on the
 // wire (a parity frame with a max-size payload) must fit the path MTU
 // without IP fragmentation.
@@ -659,7 +762,7 @@ func TestParityFrameFitsPathMTU(t *testing.T) {
 	wire := func(innerMTU int) int {
 		return innerMTU + frame.HeaderSize + frame.TagSize + fec.ParityHeaderSize(k)
 	}
-	if got := wire(1390); got > pathMTU {
+	if got := wire(1388); got > pathMTU {
 		t.Fatalf("parity frame %dB exceeds path MTU %dB", got, pathMTU)
 	}
 	if got := wire(1420); got <= pathMTU {
