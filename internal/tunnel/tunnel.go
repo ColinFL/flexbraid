@@ -134,6 +134,22 @@ type Client struct {
 // (a lost fragment would defeat FEC entirely — design §6.6).
 const pathMTU = 1500
 
+// newTransport builds the wire transport for a WAN: plain encrypted UDP or
+// the FakeTCP disguise (raw IPv4/TCP segments, docs/DESIGN.md §8.2).
+func newTransport(wcfg *config.WAN, serverAddr string) (transport.Transport, error) {
+	bind := transport.Bind{Iface: wcfg.Iface, LocalIP: wcfg.LocalIP}
+	switch wcfg.Transport {
+	case config.TransportFakeTCP:
+		return transport.NewFakeTCP(wcfg.ID, "", serverAddr, bind), nil
+	case config.TransportUDP:
+		return transport.NewUDP(wcfg.ID, "", serverAddr, bind), nil
+	case config.TransportICMP:
+		return nil, fmt.Errorf("wan %q: transport icmp is not implemented yet (M4.2b)", wcfg.ID)
+	default:
+		return nil, fmt.Errorf("wan %q: unsupported transport %q", wcfg.ID, wcfg.Transport)
+	}
+}
+
 // fecParamsFor derives codec params for one WAN from the config, honouring a
 // per-WAN max_loss override. A disabled or off-mode FEC yields pass-through
 // codecs (no buffering, no parity).
@@ -288,8 +304,8 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("too many WANs: %d (max %d)", len(cfg.WANs), maxWANs)
 	}
 	for i := range cfg.WANs {
-		if cfg.WANs[i].Transport != config.TransportUDP {
-			return nil, fmt.Errorf("M3 supports only udp transport, got %q (faketcp/icmp arrive in M4)", cfg.WANs[i].Transport)
+		if cfg.WANs[i].Transport == "" {
+			cfg.WANs[i].Transport = config.TransportUDP
 		}
 		if cfg.WANs[i].ID == "" {
 			return nil, fmt.Errorf("wan[%d].id is required", i)
@@ -366,10 +382,14 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 			}
 		}
 		mon := health.New(healthOptions(cfg.Health, fecCompensableLoss(params), probeInterval))
+		tr, err := newTransport(wcfg, cfg.Server)
+		if err != nil {
+			return nil, err
+		}
 		wan := &wanLink{
 			id:     wcfg.ID,
 			cfg:    *wcfg,
-			tr:     transport.NewUDP(wcfg.ID, "", cfg.Server, transport.Bind{Iface: wcfg.Iface, LocalIP: wcfg.LocalIP}),
+			tr:     tr,
 			enc:    enc,
 			dec:    dec,
 			health: mon,

@@ -105,6 +105,10 @@ type Config struct {
 	Health    Health   `yaml:"health"`
 	Crypto    Crypto   `yaml:"crypto"`
 	Log       Log      `yaml:"log"`
+
+	// Transport is the server-side wire format ("udp" default | "faketcp").
+	// Clients pick a per-WAN transport instead (wans[].transport).
+	Transport TransportMode `yaml:"transport"`
 }
 
 // Sched configures the packet scheduler / load balancer.
@@ -359,6 +363,16 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("client requires at least one WAN")
 		}
 		// server mode: M1 binds its own WAN transport internally
+	}
+	if c.Mode == ModeServer {
+		if c.Transport == "" {
+			c.Transport = TransportUDP
+		}
+		switch c.Transport {
+		case TransportUDP, TransportFakeTCP:
+		default:
+			return fmt.Errorf("server transport %q not supported (udp | faketcp)", c.Transport)
+		}
 	}
 	seen := map[string]bool{}
 	for i := range c.WANs {

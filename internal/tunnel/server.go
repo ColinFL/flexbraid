@@ -123,13 +123,20 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	} else {
 		log.Info("fec disabled")
 	}
+	var wanTr transport.Transport
+	switch cfg.Transport {
+	case config.TransportFakeTCP:
+		wanTr = transport.NewFakeTCP("wan", cfg.Listen, "", transport.Bind{})
+	default: // udp (and the empty default)
+		wanTr = transport.NewUDP("wan", cfg.Listen, "", transport.Bind{})
+	}
 	return &Server{
 		cfg:       cfg,
 		log:       log,
 		psk:       []byte(cfg.Crypto.Key),
 		baseAEAD:  baseAEAD,
 		mgr:       session.NewManager(),
-		wanTr:     transport.NewUDP("wan", cfg.Listen, "", transport.Bind{}),
+		wanTr:     wanTr,
 		fecParams: params,
 		fecDec:    fecDec,
 		states:    make(map[session.ID]*sessState),

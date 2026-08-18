@@ -35,6 +35,14 @@ jobs:
       - name: go test (race)
         run: go test -race ./...
 
+      - name: faketcp loopback (raw sockets, docker NET_RAW)
+        # The unprivileged runner cannot open raw sockets; run the
+        # loopback transport test inside a container with NET_RAW.
+        run: |
+          docker run --rm --cap-add=NET_RAW \
+            -v "$PWD":/src -w /src golang:$(grep '^go ' go.mod | awk '{print $2}') \
+            go test ./internal/transport/ -run 'TestFakeTCPLoopback' -v -count=1
+
       - name: cross-compile (linux / freebsd / windows)
         run: |
           GOOS=linux   GOARCH=amd64 go build ./...
