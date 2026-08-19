@@ -466,7 +466,7 @@ Pluggable wire formats, configured per WAN (`wan.transport`):
 |---|---|---|
 | `udp` | Default. Encrypted UDP tunnel. | done |
 | `faketcp` | Disguises the tunnel as TCP (3-way handshake + seq/ack simulation) to bypass UDP blocking/QoS. Derived from udp2raw's FakeTCP. Requires raw-socket + RST-suppression (iptables/nftables on Linux, pf on FreeBSD). | **M4.2a done** |
-| `icmp` | Last-resort tunnel over ICMP echo for UDP-blocked links (pull model: server data rides echo replies to the client's requests). | **M4.2b done** |
+| `icmp` | Last-resort tunnel over ICMP echo for UDP-blocked links (pull model: server data rides echo replies to the client's requests). Kernel-echo suppression via a deliberately corrupt request checksum — the marker of an authentic flexbraid client; honest pings keep their valid checksum and are served by the kernel. | **M4.2b done** |
 
 Each transport is a self-contained `Transport` interface (open/close/send/recv)
 so new wire formats are drop-in.

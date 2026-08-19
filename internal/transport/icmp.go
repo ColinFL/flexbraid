@@ -145,12 +145,21 @@ func (i *ICMP) Close() error {
 
 // Send sends a sealed frame as an echo request (client mode). The reply
 // carries the server's queued data and is returned by the next Recv.
+//
+// The request's ICMP checksum is deliberately INVALID: a kernel replies to
+// every well-formed echo request, and the server's kernel would answer our
+// own requests — indistinguishable from the flexbraid server's reply (same
+// id, same source). With a corrupt checksum the server kernel stays silent
+// (it requires a valid checksum), while the flexbraid server (which does
+// not) treats the corrupt checksum as the marker of an authentic client
+// and answers. Honest ping traffic keeps its valid checksum and is served
+// by the kernel as usual.
 func (i *ICMP) Send(b []byte) error {
 	i.mu.Lock()
 	i.mySeq++
 	seq := i.mySeq
 	i.mu.Unlock()
-	pkt := buildEcho(icmpTypeEchoRequest, i.myID, seq, b)
+	pkt := buildEcho(icmpTypeEchoRequest, i.myID, seq, b, true)
 	return i.sendTo(pkt, i.clientDstIP)
 }
 
@@ -193,12 +202,16 @@ func (i *ICMP) Recv() ([]byte, net.Addr, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		frame, src, rtype, id, ok := parseEcho(buf[:n])
+		frame, src, rtype, id, csOK, ok := parseEcho(buf[:n])
 		if !ok {
 			continue
 		}
 		if i.srv {
-			if rtype != icmpTypeEchoRequest {
+			// Only requests with a CORRUPT checksum are ours: the kernel
+			// answered valid-checksum pings itself, so a valid request
+			// must be an honest ping — let the kernel handle it and stay
+			// out of it (a reply from us would confuse the pinger).
+			if rtype != icmpTypeEchoRequest || csOK {
 				continue
 			}
 			// Drain this peer's reply queue into the response. The
@@ -228,8 +241,10 @@ func (i *ICMP) Recv() ([]byte, net.Addr, error) {
 		}
 		// Client: only replies with OUR identifier FROM THE SERVER (the
 		// raw socket sees every ICMP echo in the system; a spoofed reply
-		// with our id must not be accepted).
-		if rtype != icmpTypeEchoReply || id != i.myID || !src.IP.Equal(i.clientDstIP) {
+		// with our id must not be accepted). The checksum must be VALID —
+		// the flexbraid server answers with a proper checksum, while the
+		// kernel never replies to our corrupt-checksum requests at all.
+		if rtype != icmpTypeEchoReply || !csOK || id != i.myID || !src.IP.Equal(i.clientDstIP) {
 			continue
 		}
 		out := make([]byte, len(frame))
@@ -267,36 +282,43 @@ func (i *ICMP) sendTo(pkt []byte, dst net.IP) error {
 
 // --- packet construction / parsing ----------------------------------------
 
-// buildEcho builds one ICMP echo packet (request or reply).
-func buildEcho(typ byte, id uint16, seq uint32, payload []byte) []byte {
+// buildEcho builds one ICMP echo packet (request or reply). corruptCS
+// deliberately mangles the checksum (client requests only, see Send).
+func buildEcho(typ byte, id uint16, seq uint32, payload []byte, corruptCS bool) []byte {
 	pkt := make([]byte, icmpHdrLen+len(payload))
 	pkt[0] = typ
 	binary.BigEndian.PutUint16(pkt[4:6], id)
 	binary.BigEndian.PutUint16(pkt[6:8], uint16(seq))
 	copy(pkt[icmpHdrLen:], payload)
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
+	if corruptCS {
+		binary.BigEndian.PutUint16(pkt[2:4], ^binary.BigEndian.Uint16(pkt[2:4])) // never valid
+	}
 	return pkt
 }
 
 // parseEcho decodes a received IPv4 datagram and returns the ICMP payload,
-// source address, type and identifier. Only well-formed echo packets with
-// a valid checksum are accepted.
-func parseEcho(b []byte) (payload []byte, src *net.UDPAddr, rtype byte, id uint16, ok bool) {
+// source address, type, identifier and whether the checksum is valid. Only
+// well-formed echo packets are accepted; the checksum VALIDITY is reported
+// rather than enforced so the caller can apply the corrupt-checksum marker
+// (server accepts only invalid request checksums, client accepts only
+// valid reply checksums).
+func parseEcho(b []byte) (payload []byte, src *net.UDPAddr, rtype byte, id uint16, csOK bool, ok bool) {
 	if len(b) < ipHdrLen+icmpHdrLen {
-		return nil, nil, 0, 0, false
+		return nil, nil, 0, 0, false, false
 	}
 	if b[0]>>4 != 4 {
-		return nil, nil, 0, 0, false // IPv4 only
+		return nil, nil, 0, 0, false, false // IPv4 only
 	}
 	ihl := int(b[0]&0x0f) * 4
 	if ihl < ipHdrLen || len(b) < ihl+icmpHdrLen {
-		return nil, nil, 0, 0, false
+		return nil, nil, 0, 0, false, false
 	}
 	if b[9] != 1 {
-		return nil, nil, 0, 0, false // ICMP only
+		return nil, nil, 0, 0, false, false // ICMP only
 	}
 	if frag := binary.BigEndian.Uint16(b[6:8]) & 0x1fff; frag != 0 {
-		return nil, nil, 0, 0, false
+		return nil, nil, 0, 0, false, false
 	}
 	total := int(binary.BigEndian.Uint16(b[2:4]))
 	if total == 0 || total > len(b) {
@@ -304,18 +326,16 @@ func parseEcho(b []byte) (payload []byte, src *net.UDPAddr, rtype byte, id uint1
 	}
 	srcIP := net.IP(b[12:16]).To4()
 	if srcIP == nil {
-		return nil, nil, 0, 0, false
+		return nil, nil, 0, 0, false, false
 	}
 	icmp := b[ihl:total]
 	rtype = icmp[0]
 	if rtype != icmpTypeEchoRequest && rtype != icmpTypeEchoReply {
-		return nil, nil, 0, 0, false
+		return nil, nil, 0, 0, false, false
 	}
-	if icmpChecksum(icmp) != 0 {
-		return nil, nil, 0, 0, false
-	}
+	csOK = icmpChecksum(icmp) == 0
 	id = binary.BigEndian.Uint16(icmp[4:6])
-	return icmp[icmpHdrLen:], &net.UDPAddr{IP: srcIP, Port: 0}, rtype, id, true
+	return icmp[icmpHdrLen:], &net.UDPAddr{IP: srcIP, Port: 0}, rtype, id, csOK, true
 }
 
 // reqICMPOffset finds the ICMP header offset inside a received datagram

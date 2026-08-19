@@ -58,7 +58,7 @@ func TestICMPLoopback(t *testing.T) {
 				cliErrCh <- err
 				return
 			}
-			frame, src, rtype, id, ok := parseEcho(buf[:n])
+			frame, src, rtype, id, csOK, ok := parseEcho(buf[:n])
 			if !ok {
 				t.Logf("  raw: unparsable (%d bytes)", n)
 				continue
@@ -67,9 +67,14 @@ func TestICMPLoopback(t *testing.T) {
 			if len(show) > 24 {
 				show = show[:24]
 			}
-			t.Logf("  raw: type=%d id=%d src=%s payload=%q", rtype, id, src.IP, show)
-			if rtype == icmpTypeEchoReply && id == cli.myID && src.IP.Equal(cli.clientDstIP) {
-				cliRecvCh <- frame
+			t.Logf("  raw: type=%d id=%d src=%s cs=%v payload=%q", rtype, id, src.IP, csOK, show)
+			if rtype == icmpTypeEchoReply && csOK && id == cli.myID && src.IP.Equal(cli.clientDstIP) {
+				// Copy: frame aliases the reused read buffer, which the
+				// next readRaw overwrites (the exact bug this test once
+				// masked by producing "queue" instead of "queued").
+				out := make([]byte, len(frame))
+				copy(out, frame)
+				cliRecvCh <- out
 			}
 		}
 	}()

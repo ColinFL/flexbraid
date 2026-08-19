@@ -187,6 +187,17 @@ wans:
   `probe_interval` that is ≤1 s of added latency in the server→client
   direction. Requires root/`CAP_NET_RAW` (raw ICMP sockets), IPv4. The
   client's echo identifier is random per run.
+  **Kernel-echo suppression (checksum marker):** a kernel answers every
+  *well-formed* echo request, and the server's kernel would answer our own
+  requests — indistinguishable from the flexbraid server's reply (same id,
+  same source). The client therefore sends requests with a deliberately
+  **corrupt ICMP checksum**: the server kernel stays silent (it requires a
+  valid checksum), while the flexbraid server treats the corrupt checksum
+  as the marker of an authentic client and answers it; replies carry a
+  proper checksum. Honest ping traffic (valid checksum) is served by the
+  kernel as usual and never answered by the flexbraid server. A middlebox
+  that "fixes" ICMP checksums would break the marker — the link degrades to
+  silent rather than to wrong data.
 - `fec_max_loss_pct` overrides the global FEC cap per path (e.g. a flaky
   LTE link can carry more redundancy).
 
