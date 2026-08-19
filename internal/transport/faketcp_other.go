@@ -9,13 +9,21 @@ import (
 )
 
 // errRawPerm is unavailable on this platform; Open always fails first.
-var errRawPerm = errors.New("faketcp: raw sockets not supported on this platform")
+var errRawPerm = errors.New("faketcp/icmp: raw sockets not supported on this platform")
 
 // openRawSocket is unavailable on this platform (raw IPv4/TCP sockets
 // need linux/freebsd).
 func openRawSocket(id string, _ Bind) (int, error) {
 	return -1, errRawPerm
 }
+
+// openICMPSocket is unavailable on this platform (raw ICMP sockets need
+// linux/freebsd).
+func openICMPSocket(id string, _ Bind) (int, error) {
+	return -1, errRawPerm
+}
+
+func sendICMP(fd int, pkt []byte, dst net.IP) error { return errors.New("icmp: not open") }
 
 func closeRawSocket(fd int) error { return errors.New("faketcp: not open") }
 

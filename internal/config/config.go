@@ -369,9 +369,9 @@ func (c *Config) Validate() error {
 			c.Transport = TransportUDP
 		}
 		switch c.Transport {
-		case TransportUDP, TransportFakeTCP:
+		case TransportUDP, TransportFakeTCP, TransportICMP:
 		default:
-			return fmt.Errorf("server transport %q not supported (udp | faketcp)", c.Transport)
+			return fmt.Errorf("server transport %q not supported (udp | faketcp | icmp)", c.Transport)
 		}
 	}
 	seen := map[string]bool{}

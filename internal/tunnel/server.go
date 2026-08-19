@@ -127,6 +127,8 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	switch cfg.Transport {
 	case config.TransportFakeTCP:
 		wanTr = transport.NewFakeTCP("wan", cfg.Listen, "", transport.Bind{})
+	case config.TransportICMP:
+		wanTr = transport.NewICMP("wan", cfg.Listen, "", transport.Bind{})
 	default: // udp (and the empty default)
 		wanTr = transport.NewUDP("wan", cfg.Listen, "", transport.Bind{})
 	}

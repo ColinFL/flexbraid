@@ -141,10 +141,10 @@ func newTransport(wcfg *config.WAN, serverAddr string) (transport.Transport, err
 	switch wcfg.Transport {
 	case config.TransportFakeTCP:
 		return transport.NewFakeTCP(wcfg.ID, "", serverAddr, bind), nil
+	case config.TransportICMP:
+		return transport.NewICMP(wcfg.ID, "", serverAddr, bind), nil
 	case config.TransportUDP:
 		return transport.NewUDP(wcfg.ID, "", serverAddr, bind), nil
-	case config.TransportICMP:
-		return nil, fmt.Errorf("wan %q: transport icmp is not implemented yet (M4.2b)", wcfg.ID)
 	default:
 		return nil, fmt.Errorf("wan %q: unsupported transport %q", wcfg.ID, wcfg.Transport)
 	}

@@ -139,8 +139,8 @@ Compensable-loss math (random loss within a working path):
 ```yaml
 wans:
   - id: w1
-    transport: udp      # "udp" | "faketcp" (M4.2a: raw TCP disguise, root+
-                        # RST suppression) | "icmp" (M4.2b, not yet)
+    transport: udp      # "udp" | "faketcp" (raw TCP disguise, root+RST
+                        # suppression) | "icmp" (ping disguise, root, pull-mode)
     iface: igc1         # bind device (SO_BINDTODEVICE / IP_BOUND_IF)
     local_ip: 192.0.2.10  # bind source address (fallback)
     capacity_mbps: 300  # declared bandwidth → drives capacity-weighted balancing
@@ -179,7 +179,14 @@ wans:
     equivalent nftables rule); FreeBSD: `pf` — `pass out proto tcp flags RST`
     or a matching `block` rule;
   - the listen/connect port must not be used by a real TCP listener.
-  `icmp` arrives in M4.2b.
+- **`icmp`** — the last-resort wire format: data rides in ICMP echo
+  request/reply payloads, so a link that blocks UDP and TCP still carries
+  the tunnel (DPI sees ordinary ping). **Pull model by nature**: a host may
+  only send echo *replies*, so server→client data waits for the client's
+  next request — with FlexBraid's keepalive probes flowing every
+  `probe_interval` that is ≤1 s of added latency in the server→client
+  direction. Requires root/`CAP_NET_RAW` (raw ICMP sockets), IPv4. The
+  client's echo identifier is random per run.
 - `fec_max_loss_pct` overrides the global FEC cap per path (e.g. a flaky
   LTE link can carry more redundancy).
 
