@@ -217,12 +217,14 @@ func (i *ICMP) Recv() ([]byte, net.Addr, error) {
 				}
 				reply = append(reply, p...)
 			}
-			// Mirror ID/seq from the request.
-			_ = id
 			if err := i.sendEchoReply(src, buf, reply); err != nil {
 				return nil, nil, err
 			}
-			return frame, src, nil
+			// Copy: frame aliases the read buffer, which the next
+			// readRaw overwrites.
+			out := make([]byte, len(frame))
+			copy(out, frame)
+			return out, src, nil
 		}
 		// Client: only replies with OUR identifier FROM THE SERVER (the
 		// raw socket sees every ICMP echo in the system; a spoofed reply
@@ -230,7 +232,9 @@ func (i *ICMP) Recv() ([]byte, net.Addr, error) {
 		if rtype != icmpTypeEchoReply || id != i.myID || !src.IP.Equal(i.clientDstIP) {
 			continue
 		}
-		return frame, src, nil
+		out := make([]byte, len(frame))
+		copy(out, frame)
+		return out, src, nil
 	}
 }
 

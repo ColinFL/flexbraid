@@ -49,13 +49,28 @@ func TestICMPLoopback(t *testing.T) {
 	cliRecvCh := make(chan []byte, 8)
 	cliErrCh := make(chan error, 1)
 	go func() {
+		// Diagnose raw: read the client's fd directly and log EVERY
+		// ICMP echo packet the client's socket sees, filtered or not.
+		buf := make([]byte, 65535)
 		for {
-			b, _, err := cli.Recv()
+			n, err := readRaw(cli.fd, buf)
 			if err != nil {
 				cliErrCh <- err
 				return
 			}
-			cliRecvCh <- b
+			frame, src, rtype, id, ok := parseEcho(buf[:n])
+			if !ok {
+				t.Logf("  raw: unparsable (%d bytes)", n)
+				continue
+			}
+			show := frame
+			if len(show) > 24 {
+				show = show[:24]
+			}
+			t.Logf("  raw: type=%d id=%d src=%s payload=%q", rtype, id, src.IP, show)
+			if rtype == icmpTypeEchoReply && id == cli.myID && src.IP.Equal(cli.clientDstIP) {
+				cliRecvCh <- frame
+			}
 		}
 	}()
 
