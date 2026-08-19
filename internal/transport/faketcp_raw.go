@@ -44,7 +44,7 @@ func openRawSocket(id string, bind Bind) (int, error) {
 // transport (bind.go), applied to a raw fd.
 func bindToRaw(fd int, bind Bind) error {
 	if bind.Iface != "" {
-		err := setDeviceBinding(fd, bind.Iface)
+		err := setDeviceBinding(fd, bind.Iface, bind.FIB)
 		if err == nil {
 			return nil
 		}

@@ -27,17 +27,18 @@ var ErrDeviceBindUnsupported = errors.New("device binding is not supported on th
 type Bind struct {
 	Iface   string // device name (e.g. "igc1", "enp3s0")
 	LocalIP string // source address (e.g. "192.0.2.10")
+	FIB     int    // FreeBSD routing table (SO_SETFIB, wan.fib); -1 = unset
 }
 
 // Empty reports whether no binding was configured.
-func (b Bind) Empty() bool { return b.Iface == "" && b.LocalIP == "" }
+func (b Bind) Empty() bool { return b.Iface == "" && b.LocalIP == "" && b.FIB < 0 }
 
 // bindToDevice attaches a raw socket fd to a network device. Platform
-// specific: Linux uses SO_BINDTODEVICE, FreeBSD uses IP_BOUND_IF.
-func bindToDevice(c syscall.RawConn, iface string) error {
+// specific: Linux uses SO_BINDTODEVICE, FreeBSD uses SO_SETFIB (FIB).
+func bindToDevice(c syscall.RawConn, iface string, fib int) error {
 	var err error
 	if cerr := c.Control(func(fd uintptr) {
-		err = setDeviceBinding(int(fd), iface)
+		err = setDeviceBinding(int(fd), iface, fib)
 	}); cerr != nil {
 		return cerr
 	}

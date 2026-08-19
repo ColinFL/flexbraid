@@ -137,7 +137,7 @@ const pathMTU = 1500
 // newTransport builds the wire transport for a WAN: plain encrypted UDP or
 // the FakeTCP disguise (raw IPv4/TCP segments, docs/DESIGN.md §8.2).
 func newTransport(wcfg *config.WAN, serverAddr string) (transport.Transport, error) {
-	bind := transport.Bind{Iface: wcfg.Iface, LocalIP: wcfg.LocalIP}
+	bind := transport.Bind{Iface: wcfg.Iface, LocalIP: wcfg.LocalIP, FIB: wcfg.FIB}
 	switch wcfg.Transport {
 	case config.TransportFakeTCP:
 		return transport.NewFakeTCP(wcfg.ID, "", serverAddr, bind), nil

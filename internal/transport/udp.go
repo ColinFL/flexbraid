@@ -88,10 +88,11 @@ func (u *UDP) openClient() error {
 // silently unbound socket routes through the default route and multi-WAN
 // collapses onto one uplink without any visible sign.
 func (u *UDP) dialBound(raddr *net.UDPAddr) (*net.UDPConn, error) {
-	if u.bind.Iface != "" {
+	if u.bind.Iface != "" || u.bind.FIB >= 0 {
 		iface := u.bind.Iface
+		fib := u.bind.FIB
 		d := &net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
-			return bindToDevice(c, iface)
+			return bindToDevice(c, iface, fib)
 		}}
 		conn, err := dialUDP(d, raddr)
 		if err == nil {
