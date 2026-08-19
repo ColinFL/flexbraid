@@ -12,8 +12,9 @@ import (
 // TestICMPLoopback runs a full client↔server exchange over the loopback
 // interface with real raw ICMP sockets, exercising the PULL model: the
 // server's SendTo data is queued and drained by the client's next echo
-// request. Requires root/CAP_NET_RAW — skipped otherwise (CI runs it in a
-// NET_RAW container).
+// request. Empty replies are legal (the server had nothing queued yet), so
+// recvUntil skips them. Requires root/CAP_NET_RAW — skipped otherwise
+// (CI runs it in a NET_RAW container).
 func TestICMPLoopback(t *testing.T) {
 	const srvPort = 39998 // port ignored by icmp; kept for symmetry
 
@@ -34,17 +35,15 @@ func TestICMPLoopback(t *testing.T) {
 
 	// Recv loops for both ends.
 	srvRecvCh := make(chan []byte, 8)
-	srvAddrCh := make(chan string, 8)
 	srvErrCh := make(chan error, 1)
 	go func() {
 		for {
-			b, addr, err := srv.Recv()
+			b, _, err := srv.Recv()
 			if err != nil {
 				srvErrCh <- err
 				return
 			}
 			srvRecvCh <- b
-			srvAddrCh <- addr.String()
 		}
 	}()
 	cliRecvCh := make(chan []byte, 8)
@@ -60,17 +59,26 @@ func TestICMPLoopback(t *testing.T) {
 		}
 	}()
 
-	recvFrom := func(ch chan []byte, errCh chan error, want string) {
+	// recvUntil reads client frames until `want` arrives, skipping empty
+	// replies (pull model: nothing queued) and logging everything seen.
+	recvUntil := func(ch chan []byte, errCh chan error, want string) {
 		t.Helper()
-		select {
-		case b := <-ch:
-			if string(b) != want {
-				t.Fatalf("got %q, want %q", b, want)
+		deadline := time.After(3 * time.Second)
+		for {
+			select {
+			case b := <-ch:
+				t.Logf("  frame: %q (len %d)", b, len(b))
+				if string(b) == want {
+					return
+				}
+				if len(b) > 0 {
+					t.Fatalf("got %q, want %q", b, want)
+				}
+			case err := <-errCh:
+				t.Fatalf("recv: %v", err)
+			case <-deadline:
+				t.Fatalf("did not receive %q", want)
 			}
-		case err := <-errCh:
-			t.Fatalf("recv: %v", err)
-		case <-time.After(3 * time.Second):
-			t.Fatalf("did not receive %q", want)
 		}
 	}
 
@@ -83,8 +91,6 @@ func TestICMPLoopback(t *testing.T) {
 		if string(b) != "first" {
 			t.Fatalf("server got %q, want first", b)
 		}
-		srvAddr := <-srvAddrCh
-		t.Logf("server saw peer %s", srvAddr)
 	case err := <-srvErrCh:
 		t.Fatalf("server recv: %v", err)
 	case <-time.After(3 * time.Second):
@@ -92,8 +98,7 @@ func TestICMPLoopback(t *testing.T) {
 	}
 
 	// 2. Pull model: the server queues a reply BEFORE the next request;
-	// the client's next ping must bring it back. Two pings: the first
-	// drains the queue, the second is a clean round trip.
+	// the client's next ping must bring it back.
 	srvPeer := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
 	if err := srv.SendTo(srvPeer, []byte("queued")); err != nil {
 		t.Fatalf("server queue: %v", err)
@@ -101,7 +106,7 @@ func TestICMPLoopback(t *testing.T) {
 	if err := cli.Send([]byte("ping2")); err != nil {
 		t.Fatalf("client send 2: %v", err)
 	}
-	recvFrom(cliRecvCh, cliErrCh, "queued")
+	recvUntil(cliRecvCh, cliErrCh, "queued")
 
 	// 3. Steady-state round trips with data both ways.
 	for i := 0; i < 5; i++ {
@@ -109,7 +114,16 @@ func TestICMPLoopback(t *testing.T) {
 		if err := cli.Send(msg); err != nil {
 			t.Fatalf("client send %d: %v", i, err)
 		}
-		recvFrom(srvRecvCh, srvErrCh, string(msg))
+		select {
+		case b := <-srvRecvCh:
+			if string(b) != string(msg) {
+				t.Fatalf("server got %q, want %q", b, msg)
+			}
+		case err := <-srvErrCh:
+			t.Fatalf("server recv %d: %v", i, err)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("server missed round trip %d", i)
+		}
 		reply := []byte{0xee, byte(i)}
 		if err := srv.SendTo(srvPeer, reply); err != nil {
 			t.Fatalf("server send %d: %v", i, err)
@@ -117,6 +131,6 @@ func TestICMPLoopback(t *testing.T) {
 		if err := cli.Send([]byte{'k'}); err != nil { // tick to drain the queue
 			t.Fatalf("client tick %d: %v", i, err)
 		}
-		recvFrom(cliRecvCh, cliErrCh, string(reply))
+		recvUntil(cliRecvCh, cliErrCh, string(reply))
 	}
 }

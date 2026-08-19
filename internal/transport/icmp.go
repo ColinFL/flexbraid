@@ -224,8 +224,10 @@ func (i *ICMP) Recv() ([]byte, net.Addr, error) {
 			}
 			return frame, src, nil
 		}
-		// Client: only replies with OUR identifier.
-		if rtype != icmpTypeEchoReply || id != i.myID {
+		// Client: only replies with OUR identifier FROM THE SERVER (the
+		// raw socket sees every ICMP echo in the system; a spoofed reply
+		// with our id must not be accepted).
+		if rtype != icmpTypeEchoReply || id != i.myID || !src.IP.Equal(i.clientDstIP) {
 			continue
 		}
 		return frame, src, nil
