@@ -127,8 +127,25 @@ func TestICMPLoopback(t *testing.T) {
 		t.Fatalf("client send 2: %v", err)
 	}
 	recvUntil(cliRecvCh, cliErrCh, "queued")
+	// The "ping2" request that drained the queue is still travelling to
+	// the server's recv goroutine; the reply already arrived, so the
+	// request is buffered — consume it so it cannot pollute step 3.
+	select {
+	case b := <-srvRecvCh:
+		if string(b) != "ping2" {
+			t.Fatalf("server got %q, want ping2", b)
+		}
+	case err := <-srvErrCh:
+		t.Fatalf("server recv: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("server never saw the ping2 request")
+	}
 
-	// 3. Steady-state round trips with data both ways.
+	// 3. Steady-state round trips with data both ways. Each trip is:
+	// client msg → server replies from queue → client tick 'k' drains the
+	// next queued reply → the tick lands in the server's channel and must
+	// be consumed before the next iteration (or it would be mistaken for
+	// the next msg).
 	for i := 0; i < 5; i++ {
 		msg := []byte{byte('c' + i), byte(i)}
 		if err := cli.Send(msg); err != nil {
@@ -152,5 +169,15 @@ func TestICMPLoopback(t *testing.T) {
 			t.Fatalf("client tick %d: %v", i, err)
 		}
 		recvUntil(cliRecvCh, cliErrCh, string(reply))
+		select {
+		case b := <-srvRecvCh:
+			if string(b) != "k" {
+				t.Fatalf("server got %q, want tick 'k'", b)
+			}
+		case err := <-srvErrCh:
+			t.Fatalf("server tick %d: %v", i, err)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("server never saw tick %d", i)
+		}
 	}
 }
