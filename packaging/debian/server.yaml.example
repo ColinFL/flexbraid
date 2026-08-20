@@ -3,7 +3,8 @@
 # After install, edit this file and set crypto.key to your PSK
 # (openssl rand -hex 32). Then: systemctl enable --now flexbraid
 mode: server
-listen: 0.0.0.0:4096           session_id: auto             # auto | <hex> fixed ID (stable multi-client)
+listen: 0.0.0.0:4096           # public UDP port (see README)
+session_id: auto               # auto | <hex> fixed ID (stable multi-client)
 wg_peer: 127.0.0.1:51820     # inner WireGuard peer this trunk egresses to
 
 fec:

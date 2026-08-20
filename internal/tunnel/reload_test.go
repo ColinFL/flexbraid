@@ -44,7 +44,7 @@ func TestClientReloadRejectsStructural(t *testing.T) {
 	// server address change => restart required, nothing applied.
 	c := cli.cfg
 	copy := *c
-	copy.Server = "203.0.113.9:44"
+	copy.Server = "203.0.113.9:4096"
 	if err := cli.Reload(&copy); !errors.Is(err, ErrReloadRequiresRestart) {
 		t.Fatalf("want ErrReloadRequiresRestart, got %v", err)
 	}

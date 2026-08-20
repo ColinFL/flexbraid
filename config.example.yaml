@@ -6,7 +6,7 @@ mode: client            # "client" | "server"
 listen: 0.0.0.0:51820   # client: where inner traffic (WireGuard) points at.
                         # server: where FlexBraid clients connect.
 server: 203.0.113.1:4096   # (client only) FlexBraid server address:port
-wg_peer: 127.0.0.1:51821   # (server only) inner WireGuard peer (egress target)
+wg_peer: 127.0.0.1:51820   # (server only) inner WireGuard peer (egress target)
 session_id: auto        # "auto" (random) | <hex>; server keys sessions by this,
                         # NOT by source IP — the basis of seamless failover.
 mtu: 1388               # inner MTU. With FEC on: 1500 − 44 (frame+tag) − 68

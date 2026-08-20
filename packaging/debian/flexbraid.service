@@ -6,8 +6,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Server binds UDP :44 (<1024) → needs root; drop privileges later if
-# the OS gains CAP_NET_BIND_SERVICE + a non-root run user.
+# Server binds the configured UDP port (4096 in the example; a port <1024
+# needs root or CAP_NET_BIND_SERVICE). Drop privileges later if a non-root
+# run user is added.
 User=root
 Group=root
 ExecStart=/usr/local/bin/flexbraid -c /etc/flexbraid/server.yaml

@@ -4,7 +4,7 @@
 # set server to your VPS, then: service flexbraid start
 mode: client
 listen: 127.0.0.1:51820        # inner WireGuard interface connects here
-server: 203.0.113.10:4096
+server: 203.0.113.10:4096      # public FlexBraid server address:port
 mtu: 1390                      # inner MTU (1388 with FEC k=10)
 
 scheduler:

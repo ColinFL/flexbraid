@@ -2,7 +2,8 @@
 
 Step-by-step guide for running the FlexBraid **client** on an OPNsense
 router (FreeBSD). The field-tested setup at this project's reference
-installation: OPNsense client ↔ Debian VPS server over **UDP 4096**.
+installation: OPNsense client ↔ Debian VPS server over a public UDP port
+(4096 in the examples).
 
 > **Real-world constraint this project hit (FreeBSD 15):** the `IP_BOUND_IF`
 > socket option was removed from the FreeBSD kernel (`setsockopt` →
@@ -16,10 +17,8 @@ installation: OPNsense client ↔ Debian VPS server over **UDP 4096**.
 ## 1. Prerequisites
 
 - OPNsense ≥ 25 (FreeBSD ≥ 14.1) with console/SSH shell access.
-- A VPS running the FlexBraid **server**. Server listening port must be
-  **≤ 50** when the VPS has a DNAT that forwards high UDP ports into another
-  tunnel (this project: `udp dport 50-65535 != 51820 → office tunnel`;
-  port 4096 was taken by WireGuard, so **44** was chosen).
+- A VPS running the FlexBraid **server** on a public UDP port (the examples
+  use 4096).
 - A pre-shared key (PSK) generated and kept **outside** the public repo:
   ```sh
   openssl rand -hex 32   # → use as crypto.key (ChaCha20-Poly1305, 32 bytes)
@@ -55,7 +54,7 @@ Create `/etc/flexbraid/client.yaml` (mode `0600` — it holds the key):
 # FlexBraid client — OPNsense office router.
 mode: client
 listen: 127.0.0.1:51820        # WireGuard / inner service connects here
-server: 203.0.113.10:4096
+server: 203.0.113.10:4096      # public FlexBraid server address:port
 mtu: 1390                      # reduce if you enable FEC (see CONFIG.md)
 
 scheduler:
@@ -158,10 +157,10 @@ tail -f /var/log/flexbraid.log   # set log.file in config to capture output
 ## 5. Firewall / OPNsense notes
 
 **Outbound (client):**
-- The client *dials out* UDP to the VPS on port 4096 — standard outbound UDP
-  is enough.
+- The client *dials out* UDP to the VPS on the configured port (4096 in the
+  examples) — standard outbound UDP is enough.
 - If you enable **pf** (this OPNsense currently runs with pf disabled — see
-  memory/notes), allow `pass out proto udp to <vps> port 4096`.
+  memory/notes), allow `pass out proto udp to <server-ip> port 4096`.
 - For **FakeTCP** transport (M4.2, not yet implemented) a
   `pass out proto tcp flags RST` rule will be required to suppress RSTs.
 
@@ -179,22 +178,21 @@ tail -f /var/log/flexbraid.log   # set log.file in config to capture output
 
 ## 6. Verify the tunnel
 
-The reference VPS also runs a UDP echo (`udp-echo.py` on `127.0.0.1:51821`)
-and the FlexBraid server is configured with `wg_peer: 127.0.0.1:51821` so
-the server's egress lands on a local echo during **staging** (no production
-traffic switched yet). Verify from the router:
+The fastest end-to-end check in **staging** is to point the server's
+`wg_peer` at a local UDP echo (e.g. `socat -v UDP-LISTEN:15123,fork
+EXEC:'cat'` or a tiny `udp-echo.py`) so the server's egress lands back on a
+local socket rather than on production traffic. Verify from the router:
 
 ```sh
 # 1. client must show a live session
 tail -n 20 /var/log/flexbraid.log | grep -i "wan\|session\|health"
 # 2. send frames through the tunnel: any UDP payload written to the client's
 #    listen socket (127.0.0.1:51820) comes back echoed through the whole
-#    path. A quick netcat check from a LAN host:
-#    (the inner path is 127.0.0.1 → tunnel → VPS → echo → back)
+#    path (a netcat check from a LAN host exercises the full route).
 ```
 
-Expected field results (reference OPNsense ↔ VPS, ~12.5 ms clean ping):
-no-FEC avg RTT ~50 ms, FEC k=4/T15 avg ~125 ms, 0% loss (10/10, 50/50).
+Typical field results on a clean ~12 ms path: no-FEC avg RTT ~50 ms,
+FEC k=4/T15 avg ~125 ms, 0% loss (10/10, 50/50).
 
 ---
 
