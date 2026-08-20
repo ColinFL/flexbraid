@@ -102,6 +102,7 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Component design, Go package layout, interfaces |
 | [PROTOCOL.md](docs/PROTOCOL.md) | On-the-wire frame format, sequence & session semantics |
 | [CONFIG.md](docs/CONFIG.md) | Complete configuration reference |
+| [DEPLOY_OPNSENSE.md](docs/DEPLOY_OPNSENSE.md) | Install & run FlexBraid on OPNsense (FreeBSD 15 notes, rc.d, firewall) |
 
 ---
 
