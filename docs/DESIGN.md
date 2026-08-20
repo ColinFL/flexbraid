@@ -478,13 +478,24 @@ so new wire formats are drop-in.
 - **Cipher:** ChaCha20-Poly1305 (AEAD, constant-time, fast on CPUs without
   AES-NI, matches WireGuard's own primitives). AES-256-GCM available.
   *(Upgrade over udp2raw's AES-CBC + HMAC-SHA1.)*
-- **Keying: always a shared pre-shared key (PSK) from config (`crypto.key`).**
-  The handshake (FIRST/SESSION_ACK) uses the base key; after the handshake
-  both sides derive a **per-session key** from (PSK, session_id), so a nonce
-  is never reused across sessions. There is **no unauthenticated "ephemeral
-  key from server" path** — without a shared secret there is nothing to stop a
-  MITM from impersonating either side. (A proper X25519/signature key-exchange
-  for forward secrecy is a future roadmap item.)
+- **Keying: a shared pre-shared key (PSK) from config (`crypto.key`) is the
+  authenticator; the per-session AEAD key comes from an ephemeral X25519
+  key exchange (M5.5), so the tunnel has **perfect forward secrecy**:
+  1. The handshake (`FIRST`/KEX_REQ and `KEX_ACK`) is sealed with the base
+     key derived from the PSK alone — only a party holding the PSK can
+     complete it (mutual authentication).
+  2. Each side generates an ephemeral X25519 keypair; the ephemeral public
+     keys travel inside the handshake frames (client's in KEX_REQ, server's
+     in KEX_ACK), encrypted/authenticated under the base key.
+  3. Both sides compute `shared = X25519(priv_own, pub_peer)` and derive
+     `session = HKDF(shared, psk-as-salt, "pfs-session:<id>")`.
+  4. All data frames after the handshake use the **session** key, so a
+     nonce is never reused across sessions — and because the ephemeral
+     secrets are discarded at process exit, a later PSK compromise cannot
+     decrypt past sessions (forward secrecy).
+  There is **no unauthenticated \"ephemeral key from server\" path**: the
+  PSK binding in the HKDF salt and the base-key-sealed handshake are what
+  stop a MITM impersonating either side.
 - **Authentication / integrity:** the AEAD tag over header+payload
   authenticates the `session_id`, so a forged or hijacked session cannot inject
   frames without the key. The anti-replay sliding window rejects replayed
@@ -560,8 +571,11 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
   IPv4/TCP disguise); ICMP wire format (ping disguise, pull model);
   live-adaptive FEC (redundancy sized to measured loss, pass-through on
   clean links).
-- **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging, docs
-  site, authenticated key-exchange (forward secrecy).
+- **M5 — Ops:** *(done)* — telemetry (HTTP JSON snapshot + periodic log),
+  SIGHUP runtime reload (live subset; structural changes rejected), per-WAN
+  bounded send queue + token-bucket rate limiter (§7.6), OPNsense rc.d +
+  Debian .deb packaging, and authenticated key-exchange with **perfect
+  forward secrecy** (ephemeral X25519 + HKDF, PSK demoted to authenticator).
 
 ---
 

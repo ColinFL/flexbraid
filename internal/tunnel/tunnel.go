@@ -109,12 +109,22 @@ type Client struct {
 	cfg      *config.Config
 	log      *slog.Logger
 	baseAEAD cipher.AEAD // handshake key (derived from PSK only)
-	sessAEAD cipher.AEAD // per-session key (derived from PSK + session ID)
+	psk      []byte      // raw PSK (used to derive the PFS session key)
 	sess     *session.Client
 	wans     []*wanLink
 	byWAN    map[string]*wanLink
 	sched    *scheduler.Scheduler
 	delivery *deliveryBuffer
+
+	// PFS key exchange (M5.5): the client's ephemeral X25519 keypair is
+	// generated at NewClient; the server's ephemeral public key arrives in
+	// the KEX_ACK, and the negotiated session AEAD is published once under
+	// sessMu. Locked so send/recv loops never observe a half-written key.
+	sessMu       sync.RWMutex
+	sessAEAD     cipher.AEAD // negotiated per-session key (nil until KEX_ACK)
+	sessionReady bool        // true once sessAEAD is published
+	clientPriv   []byte      // ephemeral X25519 private key (never leaves process)
+	clientPub    []byte      // ephemeral X25519 public key (sent in KEX_REQ)
 
 	probeInterval time.Duration
 
@@ -132,6 +142,8 @@ type Client struct {
 	oversizeErrs atomic.Uint64
 	// noWANErrs throttles 'no usable WAN' logging.
 	noWANErrs atomic.Uint64
+	// preSessErrs throttles 'dropped before PFS established' logging.
+	preSessErrs atomic.Uint64
 
 	ingress *net.UDPConn // read-only after Start
 	// start marks construction time (telemetry uptime).
@@ -331,16 +343,16 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("cipher: %w", err)
 	}
 
-	// The session ID is chosen before the session key exists; both sides
-	// derive the same per-session key from (PSK, session ID).
+	// The session ID is chosen before the session key exists; the key is
+	// negotiated later via X25519 PFS (M5.5) from the client's ephemeral
+	// keypair + the server's ephemeral key in the KEX_ACK.
 	id, err := session.NewID()
 	if err != nil {
 		return nil, fmt.Errorf("session: %w", err)
 	}
-	sessKey := crypto.DeriveSessionKey([]byte(cfg.Crypto.Key), uint64(id))
-	sessAEAD, err := crypto.NewAEAD(sessKey, cfg.Crypto.Cipher)
+	clientPriv, clientPub, err := crypto.GenerateEphemeralKey()
 	if err != nil {
-		return nil, fmt.Errorf("session cipher: %w", err)
+		return nil, fmt.Errorf("pfs keypair: %w", err)
 	}
 
 	probeInterval := time.Duration(cfg.Health.ProbeInterval * float64(time.Second))
@@ -351,11 +363,13 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		cfg:           cfg,
 		log:           log,
 		baseAEAD:      baseAEAD,
-		sessAEAD:      sessAEAD,
+		psk:           []byte(cfg.Crypto.Key),
 		sess:          session.NewClientWithID(id),
 		byWAN:         make(map[string]*wanLink),
 		sched:         scheduler.New(schedulerOptions(cfg)),
 		probeInterval: probeInterval,
+		clientPriv:    clientPriv,
+		clientPub:     clientPub,
 		start:         time.Now(),
 	}
 	// Cross-path FEC shares one codec across all WANs (blocks span every
@@ -554,17 +568,19 @@ func (c *Client) LocalAddr() *net.UDPAddr {
 	return c.ingress.LocalAddr().(*net.UDPAddr)
 }
 
-// handshakeLoop sends the FIRST frame immediately and then every
+// handshakeLoop sends the FIRST/KEX_REQ frame immediately and then every
 // handshakeInterval, on one WAN. FIRST frames are sealed with the *base*
 // key — the server has no session yet, so it cannot know the per-session
-// key. The payload carries the WAN's declared capacity so the server can
-// weight its own per-path scheduling.
+// key. The payload carries the WAN's declared capacity (so the server can
+// weight its own per-path scheduling) followed by the client's ephemeral
+// X25519 public key (M5.5 PFS).
 func (c *Client) handshakeLoop(ctx context.Context, wan *wanLink) {
 	send := func() {
-		payload := make([]byte, 4)
+		payload := make([]byte, 4+crypto.PublicKeySize)
 		binary.BigEndian.PutUint32(payload, uint32(wan.cfg.CapacityMbps))
+		copy(payload[4:], c.clientPub)
 		f := &frame.Frame{
-			Flags:     frame.FlagFirst,
+			Flags:     frame.FlagFirst, // KEX_REQ
 			SessionID: uint64(c.sess.ID),
 			Seq:       c.sess.NextSeq(),
 			Payload:   payload,
@@ -597,6 +613,10 @@ func (c *Client) handshakeLoop(ctx context.Context, wan *wanLink) {
 // link and stall traffic (P3).
 func (c *Client) keepaliveLoop(ctx context.Context, wan *wanLink) {
 	send := func() {
+		aead, ok := c.getSessionAEAD()
+		if !ok {
+			return // PFS session not established yet; skip the probe
+		}
 		payload := make([]byte, 8)
 		binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixMilli()))
 		f := &frame.Frame{
@@ -605,7 +625,7 @@ func (c *Client) keepaliveLoop(ctx context.Context, wan *wanLink) {
 			Seq:       c.sess.NextSeq(),
 			Payload:   payload,
 		}
-		if err := c.send(wan, f, c.sessAEAD); err != nil {
+		if err := c.send(wan, f, aead); err != nil {
 			c.log.Warn("keepalive send failed", "wan", wan.id, "error", err)
 		}
 		wan.probeMu.Lock()
@@ -660,6 +680,60 @@ func (c *Client) handlePong(wan *wanLink, f *frame.Frame) {
 	wan.pongs.Add(1)
 }
 
+// getSessionAEAD returns the negotiated PFS session cipher, or ok=false
+// before the key exchange completes.
+func (c *Client) getSessionAEAD() (cipher.AEAD, bool) {
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.sessAEAD, c.sessionReady
+}
+
+// setSessionAEAD publishes the negotiated session cipher exactly once.
+func (c *Client) setSessionAEAD(a cipher.AEAD) {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	if c.sessionReady {
+		return
+	}
+	c.sessAEAD = a
+	c.sessionReady = true
+}
+
+// handleKexAck processes the server's key-exchange ACK (M5.5): it carries
+// the server's ephemeral X25519 public key sealed under the base (PSK) key.
+// The client derives the forward-secret session key and publishes it.
+// Returns true if the ACK authenticated.
+func (c *Client) handleKexAck(sealed []byte) bool {
+	plain, err := crypto.Open(c.baseAEAD, crypto.DirServerToClient, sealed)
+	if err != nil {
+		return false
+	}
+	f, err := frame.Decode(plain)
+	if err != nil || f.SessionID != uint64(c.sess.ID) {
+		return false
+	}
+	if len(f.Payload) < crypto.PublicKeySize {
+		return false
+	}
+	if _, ready := c.getSessionAEAD(); ready {
+		return true // already established; duplicate ACK
+	}
+	shared, err := crypto.ECDHShared(c.clientPriv, f.Payload[:crypto.PublicKeySize])
+	if err != nil {
+		return false
+	}
+	key := crypto.DerivePFSKey(c.psk, shared, uint64(c.sess.ID))
+	aead, err := crypto.NewAEAD(key, c.cfg.Crypto.Cipher)
+	if err != nil {
+		return false
+	}
+	c.setSessionAEAD(aead)
+	c.log.Info("session established",
+		"session", fmt.Sprintf("%016x", uint64(c.sess.ID)),
+		"key_exchange", "x25519-pfs")
+	return true
+}
+
 // send seals and transmits one frame on a WAN. P4: the WAN's sendMu is held
 // for the whole call so a control frame cannot interleave with a data batch.
 func (c *Client) send(wan *wanLink, f *frame.Frame, aead cipher.AEAD) error {
@@ -669,6 +743,9 @@ func (c *Client) send(wan *wanLink, f *frame.Frame, aead cipher.AEAD) error {
 }
 
 func (c *Client) sendLocked(wan *wanLink, f *frame.Frame, aead cipher.AEAD) error {
+	if aead == nil {
+		return nil // PFS session not established yet — drop (WG retransmits)
+	}
 	plain, err := f.Encode()
 	if err != nil {
 		return err
@@ -693,6 +770,10 @@ func (c *Client) sendLocked(wan *wanLink, f *frame.Frame, aead cipher.AEAD) erro
 // records the true seqs); parity frames get a fresh seq here. The whole
 // block is sent under one hold of the WAN's sendMu (P4).
 func (c *Client) sendEncoded(wan *wanLink, frames []*frame.Frame) {
+	aead, ok := c.getSessionAEAD()
+	if !ok {
+		return // PFS session not established yet — drop the batch
+	}
 	wan.sendMu.Lock()
 	defer wan.sendMu.Unlock()
 	for _, f := range frames {
@@ -700,7 +781,7 @@ func (c *Client) sendEncoded(wan *wanLink, frames []*frame.Frame) {
 			f.Seq = c.sess.NextSeq()
 		}
 		wan.framesSent.Add(1)
-		if err := c.sendLocked(wan, f, c.sessAEAD); err != nil {
+		if err := c.sendLocked(wan, f, aead); err != nil {
 			c.noteSendErr(err)
 		}
 	}
@@ -712,6 +793,10 @@ func (c *Client) sendEncoded(wan *wanLink, frames []*frame.Frame) {
 // sendEncoded there is no single sendMu: each frame takes its own WAN's
 // lock, so frames of one block leave concurrently over different links.
 func (c *Client) sendCrossEncoded(frames []*frame.Frame) {
+	aead, ok := c.getSessionAEAD()
+	if !ok {
+		return // PFS session not established yet — drop the batch
+	}
 	for _, f := range frames {
 		if f.HasFlag(frame.FlagFECParity) {
 			f.Seq = c.sess.NextSeq()
@@ -723,7 +808,7 @@ func (c *Client) sendCrossEncoded(frames []*frame.Frame) {
 		}
 		wan := c.byWAN[wanID]
 		wan.sendMu.Lock()
-		c.sendLocked(wan, f, c.sessAEAD)
+		c.sendLocked(wan, f, aead)
 		wan.sendMu.Unlock()
 	}
 }
@@ -752,6 +837,15 @@ func (c *Client) noteNoWAN() {
 	n := c.noWANErrs.Add(1)
 	if n == 1 || n%1000 == 0 {
 		c.log.Warn("no usable WAN, dropping inner datagram", "count", n)
+	}
+}
+
+// notePreSession logs inner datagrams dropped before the PFS key exchange
+// completes, throttled (M5.5; WireGuard retransmits).
+func (c *Client) notePreSession() {
+	n := c.preSessErrs.Add(1)
+	if n == 1 || n%1000 == 0 {
+		c.log.Info("dropping inner datagram before PFS session established", "count", n)
 	}
 }
 
@@ -785,6 +879,13 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 			c.noteOversize(n)
 			continue
 		}
+		// PFS gate (M5.5): until the key exchange completes, the peer
+		// cannot decrypt anything — drop the datagram; WireGuard will
+		// retransmit it once the tunnel is up.
+		if _, ok := c.getSessionAEAD(); !ok {
+			c.notePreSession()
+			continue
+		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 		f := &frame.Frame{
@@ -813,13 +914,25 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 }
 
 // recvLoop reads one WAN's sealed frames, verifies them, and routes them:
-// PONGs feed the health monitor, everything else goes through the WAN's FEC
-// decoder into the in-order delivery buffer.
+// PONGs feed the health monitor, KEX pulses complete the PFS handshake,
+// everything else goes through the WAN's FEC decoder into the in-order
+// delivery buffer.
 func (c *Client) recvLoop(wan *wanLink) {
 	for {
 		sealed, _, err := wan.tr.Recv()
 		if err != nil {
 			return // transport closed
+		}
+		hdr, err := frame.DecodeHeader(sealed)
+		if err != nil {
+			continue
+		}
+		if hdr.SessionID == uint64(c.sess.ID) && hdr.HasFlag(frame.FlagKex) {
+			// Server's PFS key-exchange ACK (sealed under the base key).
+			if c.handleKexAck(sealed) {
+				wan.lastRx.Store(time.Now().UnixNano())
+			}
+			continue
 		}
 		f, ok := c.openAndVerify(sealed)
 		if !ok {
@@ -930,7 +1043,11 @@ func (c *Client) openAndVerify(sealed []byte) (*frame.Frame, bool) {
 	if hdr.SessionID != uint64(c.sess.ID) {
 		return nil, false // wrong session — per-session key would also fail
 	}
-	plain, err := crypto.Open(c.sessAEAD, crypto.DirServerToClient, sealed)
+	aead, ok := c.getSessionAEAD()
+	if !ok {
+		return nil, false // PFS session not established yet
+	}
+	plain, err := crypto.Open(aead, crypto.DirServerToClient, sealed)
 	if err != nil {
 		return nil, false
 	}

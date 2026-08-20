@@ -20,27 +20,6 @@ func TestDeriveKeyDeterministic(t *testing.T) {
 	}
 }
 
-func TestDeriveSessionKeyDistinctAndDeterministic(t *testing.T) {
-	psk := []byte("test-psk")
-	base, err := DeriveKey(psk)
-	if err != nil {
-		t.Fatalf("derive base: %v", err)
-	}
-	k1a := DeriveSessionKey(psk, 1)
-	k1b := DeriveSessionKey(psk, 1)
-	k2 := DeriveSessionKey(psk, 2)
-
-	if !bytes.Equal(k1a, k1b) {
-		t.Fatal("session key must be deterministic for the same session ID")
-	}
-	if bytes.Equal(k1a, k2) {
-		t.Fatal("different session IDs must yield different keys")
-	}
-	if bytes.Equal(k1a, base) {
-		t.Fatal("session key must differ from the base key")
-	}
-}
-
 func TestSealOpenRoundTrip(t *testing.T) {
 	key, _ := DeriveKey([]byte("psk"))
 	aead, _ := NewAEAD(key, "chacha20poly1305")

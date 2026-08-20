@@ -98,10 +98,15 @@ type FrameCodec interface {
 // ServerSession is the server-side state for one tunnel.
 type ServerSession struct {
 	ID     ID
-	aead   cipher.AEAD // per-session key (derived from PSK + session ID)
+	aead   cipher.AEAD // per-session key (PFS: derived from ECDH + PSK + ID)
 	Enc    FrameCodec  // per-session FEC encoder (server → client), may be nil
 	seq    atomic.Uint32
 	replay crypto.ReplayWindow // client → server frames
+
+	// ServerPub is this session's ephemeral server X25519 public key (M5.5
+	// PFS). Written once at session creation, then read-only; the ACK
+	// repeats it so a lost ACK can be re-sent without re-deriving.
+	ServerPub []byte
 
 	// egress is the session's dedicated UDP socket to the WG peer (P1:
 	// per-session egress). Replies from the WG peer return on this socket,

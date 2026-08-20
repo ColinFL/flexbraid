@@ -312,6 +312,24 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 			if !s.mgr.CheckFirstReplay(id, hdr.Seq) {
 				return // replayed handshake
 			}
+			// PFS (M5.5): the FIRST payload carries the client's ephemeral
+			// X25519 public key after the 4-byte capacity. A pre-PFS client
+			// cannot handshake — protocol version moved to the PFS scheme.
+			if len(f.Payload) < 4+crypto.PublicKeySize {
+				s.log.Warn("dropping pre-PFS handshake", "session", fmt.Sprintf("%016x", uint64(id)))
+				return
+			}
+			clientPub := f.Payload[4 : 4+crypto.PublicKeySize]
+			sPriv, sPub, err := crypto.GenerateEphemeralKey()
+			if err != nil {
+				s.log.Warn("pfs keypair failed, dropping handshake", "error", err)
+				return
+			}
+			shared, err := crypto.ECDHShared(sPriv, clientPub)
+			if err != nil {
+				s.log.Warn("pfs ecdh failed, dropping handshake", "error", err)
+				return
+			}
 			// Dial the session's dedicated egress socket to the WG peer.
 			// Replies from the WG peer will return on this socket, which is
 			// how the server attributes them to the right session (P1).
@@ -321,13 +339,14 @@ func (s *Server) handleClientFrame(sealed []byte, addr net.Addr) {
 					"session", fmt.Sprintf("%016x", uint64(id)), "error", err)
 				return
 			}
-			sessKey := crypto.DeriveSessionKey(s.psk, uint64(id))
+			sessKey := crypto.DerivePFSKey(s.psk, shared, uint64(id))
 			sessAEAD, err := crypto.NewAEAD(sessKey, s.cfg.Crypto.Cipher)
 			if err != nil {
 				egress.Close()
 				return
 			}
 			sess = session.NewServerSession(id, sessAEAD)
+			sess.ServerPub = sPub
 			// Per-session FEC encoder: blocks must never mix sessions,
 			// because parity frames are sealed with the session's key.
 			enc, err := fec.NewEncoder(s.fecParams)
@@ -501,15 +520,37 @@ func (s *Server) sendPong(sess *session.ServerSession, ua *net.UDPAddr, ts []byt
 	s.sendToAddr(sess, ua, f)
 }
 
-// sendAck answers a FIRST frame with a CONTROL ACK on the same path, sealed
-// with the session key.
+// sendAck answers a FIRST/KEX_REQ frame with a key-exchange ACK on the
+// same path (M5.5): the payload is the session's ephemeral server X25519
+// public key, sealed under the base (PSK) key — the client has no session
+// key yet, so it can only read the ACK under the base key.
 func (s *Server) sendAck(sess *session.ServerSession, addr *net.UDPAddr) {
 	f := &frame.Frame{
-		Flags:     frame.FlagControl,
+		Flags:     frame.FlagControl | frame.FlagKex,
 		SessionID: uint64(sess.ID),
 		Seq:       sess.NextSeq(),
+		Payload:   sess.ServerPub,
 	}
-	s.sendToAddr(sess, addr, f)
+	s.sendToAddrKey(sess, addr, f, s.baseAEAD)
+}
+
+// sendToAddrKey seals one frame and sends it to one endpoint under sendMu
+// (P4), using an explicit key (handshake frames use the base key; data
+// frames use the session key via sendToAddr).
+func (s *Server) sendToAddrKey(sess *session.ServerSession, addr *net.UDPAddr, f *frame.Frame, aead cipher.AEAD) {
+	plain, err := f.Encode()
+	if err != nil {
+		return
+	}
+	sealed, err := crypto.Seal(aead, crypto.DirServerToClient, plain)
+	if err != nil {
+		return
+	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if err := s.wanTr.SendTo(addr, sealed); err != nil {
+		s.noteSendErr(err)
+	}
 }
 
 // sendToAddr seals one frame and sends it to one endpoint under sendMu (P4).

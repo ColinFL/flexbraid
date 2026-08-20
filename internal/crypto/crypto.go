@@ -44,25 +44,12 @@ const (
 
 // DeriveKey expands the shared PSK into the 32-byte channel key using
 // HKDF-SHA256 with a fixed salt and info string. This is the *base* key
-// used for the handshake (FIRST/SESSION_ACK frames) only.
+// used for the handshake (FIRST/KEX_REQ and KEX_ACK frames) only.
 func DeriveKey(psk []byte) ([]byte, error) {
 	if len(psk) == 0 {
 		return nil, errors.New("crypto: empty PSK")
 	}
 	return derive(psk, "flexbraid-v1", "channel-key"), nil
-}
-
-// DeriveSessionKey derives the per-session key from the PSK and session ID.
-// Every session gets its own key, so a (dir, seq) nonce is never reused
-// under the same key across sessions — AEAD nonce reuse would be
-// catastrophic. All frames after the handshake use this key.
-func DeriveSessionKey(psk []byte, sessionID uint64) []byte {
-	info := make([]byte, 0, 8+8)
-	info = append(info, "session:"...)
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], sessionID)
-	info = append(info, b[:]...)
-	return derive(psk, "flexbraid-v1", string(info))
 }
 
 func derive(psk []byte, salt, info string) []byte {

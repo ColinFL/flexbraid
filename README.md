@@ -117,7 +117,9 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
   standby), with graceful drain.
 - **Health:** EWMA loss/RTT/jitter with "fast rise, slow decay" +
   circuit-breaker state machine (HEALTHY → DEGRADED → DOWN → HEALTHY).
-- **Security:** ChaCha20-Poly1305 AEAD + anti-replay.
+- **Security:** ChaCha20-Poly1305 AEAD + anti-replay, with **perfect forward
+  secrecy** via an ephemeral X25519 handshake (PSK authenticates, ECDH
+  keys each session).
 
 ---
 

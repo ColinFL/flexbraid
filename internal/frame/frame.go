@@ -37,6 +37,11 @@ const (
 	FlagFirst uint8 = 1 << 3
 	// FlagPong marks a keepalive reply (server → client, RTT probe echo).
 	FlagPong uint8 = 1 << 4
+	// FlagKex marks the key-exchange ACK (server → client, M5.5 PFS): the
+	// payload carries the server's ephemeral X25519 public key, sealed under
+	// the base (PSK) key so the client can read it before the session key
+	// exists.
+	FlagKex uint8 = 1 << 5
 )
 
 // Frame is a decoded or to-be-encoded frame. Payload holds the plaintext

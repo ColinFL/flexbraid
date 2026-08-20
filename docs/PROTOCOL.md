@@ -56,7 +56,9 @@ Header size (before payload): **28 bytes**. Tag: 16 bytes.
   - `0x01` `FEC_PARITY` — payload is FEC parity, not inner data.
   - `0x02` `KEEPALIVE` — no inner data; used for liveness/RTT probing.
   - `0x04` `CONTROL` — control/telemetry payload (see §5).
-  - `0x08` `FIRST` — first frame of a session (client handshake).
+  - `0x08` `FIRST` — first frame of a session (client key-exchange request).
+  - `0x20` `KEX` — key-exchange ACK (server → client, M5.5 PFS; always set
+    together with `CONTROL`).
 - **session_id** — 64-bit random value chosen by the client. The server keys
   the tunnel by this and **ignores source IP/port changes** (the basis of
   seamless failover).
@@ -71,11 +73,22 @@ Header size (before payload): **28 bytes**. Tag: 16 bytes.
 
 ## 3. Session lifecycle
 
-### Connect
-1. Client sends a frame with `FIRST`, a fresh random `session_id`, and its
-   capabilities (cipher, FEC params) in the payload.
-2. Server replies `CONTROL` `SESSION_ACK`, echoing the `session_id` and its own
-   parameters. From then on both sides use that `session_id`.
+### Connect (M5.5: X25519 key exchange)
+1. Client sends a frame with `FIRST`, a fresh random `session_id`, and a
+   payload of `capacity_mbps (u32) || client_ephemeral_x25519_pubkey (32)`,
+   sealed with the **base** key HKDF(PSK, "channel-key").
+2. Server authenticates, generates its own ephemeral X25519 keypair, computes
+   `shared = X25519(server_priv, client_pub)` and the session key
+   `HKDF(shared, psk, "pfs-session:<id>")`, creates the session, and replies
+   `CONTROL|KEX` whose payload is `server_ephemeral_x25519_pubkey (32)`, sealed
+   with the **base** key (the client has no session key yet).
+3. Client computes the same shared secret and session key, then sends all
+   further frames sealed with it. Server-side authentication of the first
+   data frame confirms key agreement. From then on both sides use that
+   `session_id` and the forward-secret session key.
+Lost handshake frames are covered by the client re-sending `FIRST` every
+`handshakeInterval`; the server re-ACs any `FIRST` for an existing session
+(no re-key).
 
 ### Endpoint migration (failover)
 Because `session_id` — not source IP — identifies a session, a client that
@@ -162,16 +175,19 @@ messages; wire numbering is reserved here and documented there.
 
 ## 6. Security
 
-- **Keying: shared PSK only.** ChaCha20-Poly1305 (default) or AES-256-GCM, key
-  derived from `crypto.key`. There is **no unauthenticated ephemeral-key path**:
-  without a shared secret nothing prevents a MITM from impersonating either
-  side. (Authenticated key-exchange is a roadmap item, not v1.)
-- **Per-session keys:** the handshake (FIRST/SESSION_ACK) uses the *base* key
-  HKDF(PSK, "channel-key"). Once the server has authenticated a FIRST frame
-  it derives the *session* key HKDF(PSK, "session:"+session_id), and every
-  later frame in both directions uses it. This guarantees a (dir, seq) nonce
-  is never reused under the same key across sessions — AEAD nonce reuse
-  would be catastrophic.
+- **Keying: PSK authenticates, X25519 provides PFS (M5.5).** ChaCha20-Poly1305
+  (default) or AES-256-GCM. There is **no unauthenticated ephemeral-key path**:
+  the base-key-sealed handshake + PSK-as-HKDF-salt stop a MITM impersonating
+  either side.
+- **Per-session keys (forward secrecy):** the handshake
+  (FIRST = KEX_REQ, `CONTROL|KEX` = KEX_ACK) uses the *base* key
+  HKDF(PSK, "channel-key"). The client's ephemeral pubkey rides in the FIRST
+  payload; the server answers with its own ephemeral pubkey in the ACK. Both
+  sides then compute *session* = HKDF(shared, PSK-as-salt,
+  "pfs-session:"+session_id) from the X25519 shared secret, and every later
+  frame in both directions uses it. Ephemeral keys die with the process, so a
+  later PSK compromise cannot decrypt past sessions (forward secrecy), and a
+  (dir, seq) nonce is never reused under the same key across sessions.
 - **Authentication before state:** frames are AEAD-authenticated **before**
   the replay window is touched and before session state is created or
   updated. An unauthenticated attacker therefore cannot slide the replay
