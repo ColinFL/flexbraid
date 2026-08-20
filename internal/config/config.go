@@ -166,9 +166,9 @@ type FEC struct {
 type WAN struct {
 	ID            string        `yaml:"id"`
 	Transport     TransportMode `yaml:"transport"`
-	Iface         string        `yaml:"iface"`   // bind device (SO_BINDTODEVICE on Linux; requires privilege)
-	LocalIP       string        `yaml:"local_ip"` // bind source address (fallback when iface bind is denied)
-	FIB           int           `yaml:"fib"`      // FreeBSD routing table (SO_SETFIB); -1 = unset, needs net.fibs>1
+	Iface         string        `yaml:"iface"`            // bind device (SO_BINDTODEVICE on Linux; requires privilege)
+	LocalIP       string        `yaml:"local_ip"`         // bind source address (fallback when iface bind is denied)
+	FIB           int           `yaml:"fib"`              // FreeBSD routing table (SO_SETFIB); -1 = unset, needs net.fibs>1
 	CapacityMbps  int           `yaml:"capacity_mbps"`    // declared bandwidth, used by balance_by=capacity
 	Weight        float64       `yaml:"weight"`           // manual multiplier (default 1.0)
 	FECMaxLossPct *float64      `yaml:"fec_max_loss_pct"` // per-path FEC override (nil = global)
