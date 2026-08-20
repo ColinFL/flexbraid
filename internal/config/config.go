@@ -65,9 +65,10 @@ const (
 type FECMode string
 
 const (
-	// FECAdaptive is the default mode. TODO(M3): adjust redundancy from the
-	// health monitor's measured loss in real time; until then it computes
-	// redundancy once from max_loss_pct at startup (M2 behaviour).
+	// FECAdaptive is the default mode: redundancy is sized live from the
+	// health monitor's measured loss (docs/DESIGN.md §6), with pass-through
+	// on clean links (no latency, no overhead) and coding scaled up as loss
+	// appears.
 	FECAdaptive FECMode = "adaptive"
 	// FECFixed keeps a constant configured overhead.
 	FECFixed FECMode = "fixed"

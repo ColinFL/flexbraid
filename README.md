@@ -139,9 +139,15 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
   circuit breaker with in-band loss telemetry and a silence watchdog,
   **live-adaptive FEC** (pass-through on clean links, coding sized to
   measured loss when it appears).
-- **M4 — Resilience:** endpoint migration, warm failover, FakeTCP/ICMP,
-  cross-path FEC.
-- **M5 — Ops:** telemetry, runtime reload, OPNsense/Debian packaging.
+- **M4 — Resilience** *(done)*: cross-path FEC (blocks spread across all
+  WANs, whole-WAN loss survivable at capacity cost), FakeTCP + ICMP wire
+  formats, live-adaptive FEC (redundancy sized to measured loss,
+  pass-through on clean links), endpoint migration/warm failover.
+- **M5 — Ops** *(done)*: telemetry (HTTP JSON snapshot + periodic log),
+  SIGHUP runtime reload (live subset), per-WAN bounded queue + token-bucket
+  rate limiter, OPNsense rc.d + Debian .deb packaging, authenticated
+  key-exchange with **perfect forward secrecy** (ephemeral X25519 + HKDF,
+  PSK demoted to authenticator).
 
 See [DESIGN.md §14](docs/DESIGN.md#14-roadmap) for details.
 
