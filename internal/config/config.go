@@ -106,6 +106,7 @@ type Config struct {
 	Crypto    Crypto    `yaml:"crypto"`
 	Log       Log       `yaml:"log"`
 	Telemetry Telemetry `yaml:"telemetry"`
+	Queue     Queue     `yaml:"queue"`
 
 	// Transport is the server-side wire format ("udp" default | "faketcp").
 	// Clients pick a per-WAN transport instead (wans[].transport).
@@ -211,6 +212,25 @@ type Telemetry struct {
 	// IntervalSec > 0 logs the JSON snapshot periodically via slog
 	// (structured log, key "telemetry"). 0 = off.
 	IntervalSec float64 `yaml:"interval_sec"`
+}
+
+// Queue tunes the bounded per-WAN send queue (docs/DESIGN.md §7.6).
+type Queue struct {
+	// Enabled turns on the bounded queue + token-bucket rate limiter
+	// (nil/absent = default true). WireGuard has no congestion control, so
+	// without this a fast WAN can bufferbloat a slow one and memory grows
+	// without bound.
+	Enabled *bool `yaml:"enabled"`
+	// MaxBytes bounds each WAN's outbound queue (BDP-ish memory guard),
+	// default 262144 (256 KiB).
+	MaxBytes int `yaml:"max_bytes"`
+	// Drop is the overflow policy: "oldest" (default — drop the longest
+	// buffered frame; TCP-ish flows want the newest bytes) or "newest"
+	// (drop the just-arrived frame; real-time UDP wants the latest state).
+	Drop string `yaml:"drop"`
+	// RateLimit gates the consumer to wans[].capacity_mbps via a token
+	// bucket (default true).
+	RateLimit bool `yaml:"rate_limit"`
 }
 
 // Load reads and parses a YAML config file, then validates it.
@@ -464,6 +484,22 @@ func (c *Config) Validate() error {
 		if _, _, err := net.SplitHostPort(c.Telemetry.Listen); err != nil {
 			return fmt.Errorf("telemetry.listen must be host:port, got %q", c.Telemetry.Listen)
 		}
+	}
+	// Queue defaults (§7.6): enabled by default, 256 KiB bound, drop-oldest,
+	// rate-limited.
+	q := &c.Queue
+	if q.Enabled == nil {
+		t := true
+		q.Enabled = &t
+	}
+	if q.MaxBytes <= 0 {
+		q.MaxBytes = 262144
+	}
+	if q.Drop == "" {
+		q.Drop = "oldest"
+	}
+	if q.Drop != "oldest" && q.Drop != "newest" {
+		return fmt.Errorf("queue.drop must be \"oldest\" or \"newest\", got %q", q.Drop)
 	}
 	return nil
 }

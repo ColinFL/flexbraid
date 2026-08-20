@@ -43,3 +43,37 @@ func TestTelemetryPathCustom(t *testing.T) {
 		t.Errorf("got %+v", c.Telemetry)
 	}
 }
+
+func TestQueueDefaults(t *testing.T) {
+	c, err := loadString(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Queue.Enabled == nil || !*c.Queue.Enabled {
+		t.Error("queue.enabled should default true")
+	}
+	if c.Queue.MaxBytes != 262144 {
+		t.Errorf("queue.max_bytes default = %d, want 262144", c.Queue.MaxBytes)
+	}
+	if c.Queue.Drop != "oldest" {
+		t.Errorf("queue.drop default = %q, want oldest", c.Queue.Drop)
+	}
+}
+
+func TestQueueValidation(t *testing.T) {
+	cfg := sample + "queue:\n  enabled: false\n  drop: bogus\n"
+	if _, err := loadString(cfg); err == nil {
+		t.Fatal("queue.drop=bogus should be rejected")
+	}
+	cfg = sample + "queue:\n  enabled: false\n  max_bytes: 4096\n"
+	c, err := loadString(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *c.Queue.Enabled {
+		t.Error("queue.enabled should be false")
+	}
+	if c.Queue.MaxBytes != 4096 {
+		t.Errorf("max_bytes = %d, want 4096", c.Queue.MaxBytes)
+	}
+}

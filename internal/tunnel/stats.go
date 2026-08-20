@@ -21,6 +21,7 @@ type WANStats struct {
 	Pongs        uint64  `json:"pongs"`          // answered probes
 	MissedProbes uint64  `json:"missed_probes"`  // unanswered probes
 	LastRxAgeMs  int64   `json:"last_rx_age_ms"` // age of last VALID inbound frame, ms
+	QueueDrops   uint64  `json:"queue_drops"`    // frames dropped by the bounded send queue (§7.6)
 }
 
 // FECStats aggregates forward-error-correction counters.
@@ -76,6 +77,9 @@ func (c *Client) Snapshot() Snapshot {
 		}
 		if last := wan.lastRx.Load(); last > 0 {
 			w.LastRxAgeMs = time.Since(time.Unix(0, last)).Milliseconds()
+		}
+		if wan.q != nil {
+			_, _, w.QueueDrops = wan.q.stats()
 		}
 		s.WANs = append(s.WANs, w)
 	}

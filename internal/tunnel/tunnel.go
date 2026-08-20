@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/cipher"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -94,7 +95,14 @@ type wanLink struct {
 	probeOut   bool          // previous probe unanswered?
 	probeRTT   time.Duration // RTT of the last answered probe
 	probeStart time.Time     // when the outstanding probe was sent
+
+	// q is the bounded send queue + token bucket (§7.6); nil disables it.
+	q *sendQueue
 }
+
+// errQueueDropped reports that a frame could not be queued (overflow or the
+// frame exceeding the queue bound).
+var errQueueDropped = errors.New("send queue dropped frame")
 
 // Client is the FlexBraid tunnel client (office side).
 type Client struct {
@@ -367,6 +375,8 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		}
 	}
 	// Per-WAN transports, FEC codecs and health monitors.
+	queueDrop, _ := parseQueueDrop(cfg.Queue.Drop) // validated already
+	queueEnabled := cfg.Queue.Enabled != nil && *cfg.Queue.Enabled
 	for i := range cfg.WANs {
 		wcfg := &cfg.WANs[i]
 		params, err := fecParamsFor(cfg, wcfg)
@@ -389,6 +399,18 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Per-WAN bounded send queue + token bucket (§7.6). The rate is
+		// the declared capacity in bytes/second (Mbps → MB/s → B/s); the
+		// bucket holds one queue-worth of burst so short bursts ride out
+		// on FEC blocks without artificial pacing.
+		var q *sendQueue
+		if queueEnabled {
+			rateBps := 0.0
+			if cfg.Queue.RateLimit {
+				rateBps = float64(wcfg.CapacityMbps) * 1_000_000 / 8
+			}
+			q = newSendQueue(cfg.Queue.MaxBytes, queueDrop, rateBps)
+		}
 		wan := &wanLink{
 			id:     wcfg.ID,
 			cfg:    *wcfg,
@@ -396,6 +418,7 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 			enc:    enc,
 			dec:    dec,
 			health: mon,
+			q:      q,
 		}
 		c.wans = append(c.wans, wan)
 		c.byWAN[wcfg.ID] = wan
@@ -404,7 +427,8 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 			"wan", wcfg.ID,
 			"transport", wcfg.Transport,
 			"capacity_mbps", wcfg.CapacityMbps,
-			"fec", fecSummary(params))
+			"fec", fecSummary(params),
+			"queue", queueEnabled)
 	}
 	// Delivery buffer: gap timeout covers FEC block assembly + path RTT
 	// skew (configurable; 100ms default for mixed cable+LTE uplinks).
@@ -483,6 +507,11 @@ func (c *Client) Run(ctx context.Context) error {
 	// One handshake + keepalive + recv loop per WAN.
 	var recvWG sync.WaitGroup
 	for _, wan := range c.wans {
+		if wan.q != nil {
+			// Queue consumer: drains the bounded FIFO and paces writes to
+			// the WAN's capacity (§7.6). Stops with ctx.
+			go wan.q.run(ctx, wan.tr.Send, c.log)
+		}
 		go c.handshakeLoop(ctx, wan)
 		go c.keepaliveLoop(ctx, wan)
 		recvWG.Add(1)
@@ -647,6 +676,14 @@ func (c *Client) sendLocked(wan *wanLink, f *frame.Frame, aead cipher.AEAD) erro
 	sealed, err := crypto.Seal(aead, crypto.DirClientToServer, plain)
 	if err != nil {
 		return err
+	}
+	if wan.q != nil {
+		// Bounded queue (§7.6): non-blocking; overflow applies the drop
+		// policy. The consumer goroutine owns the actual transport write.
+		if !wan.q.enqueue(sealed) {
+			return errQueueDropped
+		}
+		return nil
 	}
 	return wan.tr.Send(sealed)
 }

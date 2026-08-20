@@ -306,6 +306,27 @@ telemetry:
 
 ---
 
+## `queue` (M5.3, §7.6)
+
+Bounded per-WAN send queue + token-bucket rate limiter on the **client**
+(the office box paces its multiple uplinks). WireGuard has no congestion
+control, so without this a fast WAN can bufferbloat a slow one and memory
+grows without bound.
+
+```yaml
+queue:
+  enabled: true       # false disables the queue + rate limiter entirely
+  max_bytes: 262144   # per-WAN outbound queue bound (BDP-ish memory guard)
+  drop: oldest        # overflow policy: "oldest" | "newest"
+  rate_limit: true    # pace each WAN to wans[].capacity_mbps (token bucket)
+```
+
+- Producers (ingress, FEC tick) are **non-blocking** — they only enqueue.
+  A consumer goroutine per WAN owns the actual transport write.
+- See `queue_drops` in the telemetry snapshot to watch overflow.
+
+---
+
 ## Runtime reload (M5.2)
 
 Send **SIGHUP** to a running `flexbraid` to re-read the config file. The

@@ -363,21 +363,21 @@ DEGRADED path keeps a token weight (0.2) so in-flight work finishes; in
 `health.down_grace_sec` additionally debounces the DOWN transition itself
 (anti-flap), so a flapping link does not slam the scheduler between states.
 
-### 7.6 Queueing & backpressure (deferred to M5)
-WireGuard has no congestion control, so FlexBraid will eventually own the
-queue discipline:
-- **Bounded per-WAN send queue**, sized to a latency budget (BDP-aware), never
-  unbounded.
-- **Rate limiter** per WAN at its declared `capacity_mbps` (token bucket) so a
-  fast WAN cannot bufferbloat a slow one.
-- **Drop policy on overflow:** `drop-oldest` for TCP-ish flows, `drop-newest`
-  for real-time UDP (games want the latest state).
-- **No full backpressure to the ingress:** WG/UDP cannot be throttled upstream,
-  so backpressure would only add latency, not remove load.
+### 7.6 Queueing & backpressure (M5.3)
+WireGuard has no congestion control, so FlexBraid owns the queue
+discipline (**implemented on the client** — the office box paces its
+uplinks):
+- **Bounded per-WAN send queue**, sized by `queue.max_bytes` (BDP-ish),
+  never unbounded.
+- **Rate limiter** per WAN at its declared `capacity_mbps` (token bucket)
+  so a fast WAN cannot bufferbloat a slow one.
+- **Drop policy on overflow:** `drop-oldest` for TCP-ish flows,
+  `drop-newest` for real-time UDP (games want the latest state).
+- **No full backpressure to the ingress:** WG/UDP cannot be throttled
+  upstream, so producers only enqueue; drops happen at the queue bound.
 
-The M3.1 config surface intentionally does **not** expose these knobs yet —
-the delivery buffer's `max_pending` bound (§5) provides the memory guard in
-the meantime. Scheduled for M5.
+The server side (a single shared trunk) is not rate-paced yet; the
+delivery buffer's `max_pending` bound provides its memory guard.
 
 ---
 
