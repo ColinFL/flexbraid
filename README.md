@@ -105,6 +105,7 @@ Full reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | [DEPLOY_OPNSENSE.md](docs/DEPLOY_OPNSENSE.md) | Install & run FlexBraid on OPNsense (FreeBSD 15 notes, rc.d, firewall) |
 | [packaging/opnsense](packaging/opnsense/README.md) | OPNsense rc.d service + installer |
 | [packaging/debian](packaging/debian/README.md) | Debian `.deb` build (systemd) |
+| [tests/netem](tests/netem/README.md) | Linux `tc netem` integration harness (loss/jitter/hard-loss checks) |
 
 ---
 

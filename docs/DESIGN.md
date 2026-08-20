@@ -589,7 +589,7 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
 - **Integration (Linux):** `tc netem` to simulate per-path loss/latency/jitter
   and hard link loss; verify WireGuard traffic flows end-to-end and that a WAN
   cutover preserves an in-flight TCP session (`ss` / `nethogs` / throughput
-  tests).
+  tests). *(Harness implemented in `tests/netem/` — see its README.)*
 - **Resilience:** kill a path mid-transfer, assert bounded packet loss and
   session survival; assert `recover_min` re-add behaviour; assert a
   load-balanced session keeps both WAN endpoints active and answers on the
