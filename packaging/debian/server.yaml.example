@@ -1,0 +1,35 @@
+# FlexBraid server config — Debian VPS.
+#
+# After install, edit this file and set crypto.key to your PSK
+# (openssl rand -hex 32). Then: systemctl enable --now flexbraid
+mode: server
+listen: 0.0.0.0:4096           session_id: auto             # auto | <hex> fixed ID (stable multi-client)
+wg_peer: 127.0.0.1:51820     # inner WireGuard peer this trunk egresses to
+
+fec:
+  enabled: true
+  mode: adaptive             # adaptive | fixed | off | crosspath
+  data_shards: 4
+  max_loss_pct: 20
+  block_timeout_ms: 15
+
+delivery:
+  gap_timeout_ms: 150
+  max_pending: 4096
+
+health:
+  probe_interval: 1
+  down_after_misses: 3
+  down_grace_sec: 1
+  recover_min: 2
+
+crypto:
+  key: "change-me"           # REQUIRED: replace with your 32-byte hex PSK
+  cipher: chacha20poly1305
+
+telemetry:
+  listen: "127.0.0.1:9080"   # optional HTTP JSON stats (no auth — loopback only)
+  interval_sec: 0
+
+log:
+  level: info

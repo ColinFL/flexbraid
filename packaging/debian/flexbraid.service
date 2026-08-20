@@ -1,0 +1,29 @@
+[Unit]
+Description=FlexBraid multi-WAN bonding tunnel
+Documentation=https://github.com/ColinFL/flexbraid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Server binds UDP :44 (<1024) → needs root; drop privileges later if
+# the OS gains CAP_NET_BIND_SERVICE + a non-root run user.
+User=root
+Group=root
+ExecStart=/usr/local/bin/flexbraid -c /etc/flexbraid/server.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/flexbraid
+
+# Optional hardening for a pure "server" mode:
+#   IPAddressDeny=10.0.0.1    (if WG peer should be reached otherwise)
+# Leave commented: the server dials the WG peer inside the box (127.0.0.1).
+
+[Install]
+WantedBy=multi-user.target

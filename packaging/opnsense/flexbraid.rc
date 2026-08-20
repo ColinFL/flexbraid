@@ -1,0 +1,51 @@
+#!/bin/sh
+# PROVIDE: flexbraid
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# FlexBraid tunnel client/server rc.d script (OPNsense / FreeBSD).
+# Enable in /etc/rc.conf:
+#   flexbraid_enable="YES"
+#   flexbraid_config="/etc/flexbraid/client.yaml"
+#   flexbraid_user="root"
+#
+# reload = SIGHUP (re-read config, apply live subset, see docs/CONFIG.md).
+
+. /etc/rc.subr
+
+name="flexbraid"
+rcvar=flexbraid_enable
+
+load_rc_config $name
+
+: ${flexbraid_config:="/etc/flexbraid/client.yaml"}
+: ${flexbraid_user:="root"}
+
+command="/usr/local/bin/flexbraid"
+command_args="-c ${flexbraid_config}"
+pidfile="/var/run/flexbraid.pid"
+
+procname="flexbraid"
+
+start_precmd="flexbraid_precmd"
+export_paths=1
+
+flexbraid_precmd()
+{
+	# The config file holds the PSK; keep it root-only.
+	if [ ! -f "${flexbraid_config}" ]; then
+		err 1 "flexbraid: config ${flexbraid_config} not found"
+	fi
+	chmod 600 "${flexbraid_config}" 2>/dev/null || true
+}
+
+extra_commands="status reload"
+
+reload_cmd="flexbraid_reload"
+flexbraid_reload()
+{
+	echo "Sending SIGHUP to flexbraid"
+	kill -HUP `cat ${pidfile} 2>/dev/null` 2>/dev/null && echo "reload signal sent" || err 1 "flexbraid not running"
+}
+
+run_rc_command "$1"

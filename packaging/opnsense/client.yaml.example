@@ -1,0 +1,51 @@
+# FlexBraid client config — OPNsense office router.
+#
+# After install: set crypto.key to your PSK (same as the server),
+# set server to your VPS, then: service flexbraid start
+mode: client
+listen: 127.0.0.1:51820        # inner WireGuard interface connects here
+server: 203.0.113.10:4096
+mtu: 1390                      # inner MTU (1388 with FEC k=10)
+
+scheduler:
+  mode: lb
+  affinity: packet
+  balance_by: capacity
+
+fec:
+  enabled: true
+  mode: adaptive               # adaptive | fixed | off | crosspath
+  data_shards: 4
+  max_loss_pct: 20
+  block_timeout_ms: 15
+
+wans:
+  - id: w1
+    transport: udp
+    # On FreeBSD 15 do NOT set iface (IP_BOUND_IF removed). Optional if the
+    # WAN has a real address:
+    # local_ip: 192.0.2.10
+    capacity_mbps: 300
+
+delivery:
+  gap_timeout_ms: 150
+  max_pending: 4096
+
+health:
+  probe_interval: 1
+  down_after_misses: 3
+  down_grace_sec: 1
+  recover_min: 2
+
+queue:
+  enabled: true
+  max_bytes: 262144
+  drop: oldest                 # "oldest" (TCP-ish) | "newest" (real-time)
+  rate_limit: true
+
+crypto:
+  key: "change-me"             # REQUIRED: replace with your 32-byte hex PSK
+  cipher: chacha20poly1305
+
+log:
+  level: info
