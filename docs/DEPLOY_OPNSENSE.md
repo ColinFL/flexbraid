@@ -55,19 +55,15 @@ Create `/etc/flexbraid/client.yaml` (mode `0600` — it holds the key):
 mode: client
 listen: 127.0.0.1:51820        # WireGuard / inner service connects here
 server: 203.0.113.10:4096      # public FlexBraid server address:port
-mtu: 1390                      # reduce if you enable FEC (see CONFIG.md)
-
+#
+# FEC and inner MTU are SERVER-PUSHED: the server announces them in the
+# key-exchange ACK and the client adopts them — do NOT set fec:/mtu here.
+# Set the WireGuard interface MTU to the value the server advertises.
+#
 scheduler:
   mode: lb
-  affinity: packet             # required for fec.mode: crosspath
+  affinity: packet
   balance_by: capacity
-
-fec:
-  enabled: true
-  mode: adaptive               # | fixed | off | crosspath
-  data_shards: 4
-  max_loss_pct: 20
-  block_timeout_ms: 15
 
 wans:
   - id: w1

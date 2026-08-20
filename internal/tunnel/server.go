@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/cipher"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -73,6 +74,12 @@ type Server struct {
 	wanTr     transport.Transport
 	fecParams fec.Params
 	fecDec    *fec.Decoder // client → server (all sessions, keyed per path)
+
+	// ann is the JSON-encoded config.ServerAnnounce appended to every
+	// KEX_ACK after the ephemeral server X25519 key: the FEC geometry and
+	// inner MTU the client must adopt (single source of truth — see
+	// config.ServerAnnounce).
+	ann []byte
 
 	// egressAddr is the resolved WG peer address (read-only after Start).
 	egressAddr *net.UDPAddr
@@ -134,6 +141,14 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	default: // udp (and the empty default)
 		wanTr = transport.NewUDP("wan", cfg.Listen, "", transport.Bind{})
 	}
+	// The announce is baked once at construction: the server's own codecs
+	// (fecParams, fecDec, per-session encoders) are built from these very
+	// values, so what the server pushes is by construction what it codes
+	// with. cfg.Validate() has already defaulted every FEC/MTU field.
+	ann, err := json.Marshal(config.ServerAnnounce{Version: config.AnnounceVersion, MTU: cfg.MTU, FEC: cfg.FEC})
+	if err != nil {
+		return nil, fmt.Errorf("server announce: %w", err)
+	}
 	return &Server{
 		cfg:       cfg,
 		log:       log,
@@ -143,6 +158,7 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		wanTr:     wanTr,
 		fecParams: params,
 		fecDec:    fecDec,
+		ann:       ann,
 		states:    make(map[session.ID]*sessState),
 		start:     time.Now(),
 	}, nil
@@ -523,13 +539,18 @@ func (s *Server) sendPong(sess *session.ServerSession, ua *net.UDPAddr, ts []byt
 // sendAck answers a FIRST/KEX_REQ frame with a key-exchange ACK on the
 // same path (M5.5): the payload is the session's ephemeral server X25519
 // public key, sealed under the base (PSK) key — the client has no session
-// key yet, so it can only read the ACK under the base key.
+// key yet, so it can only read the ACK under the base key. The server's
+// authoritative FEC/MTU announce is appended after the key; the client
+// adopts it (see config.ServerAnnounce).
 func (s *Server) sendAck(sess *session.ServerSession, addr *net.UDPAddr) {
+	payload := make([]byte, 0, len(sess.ServerPub)+len(s.ann))
+	payload = append(payload, sess.ServerPub...)
+	payload = append(payload, s.ann...)
 	f := &frame.Frame{
 		Flags:     frame.FlagControl | frame.FlagKex,
 		SessionID: uint64(sess.ID),
 		Seq:       sess.NextSeq(),
-		Payload:   sess.ServerPub,
+		Payload:   payload,
 	}
 	s.sendToAddrKey(sess, addr, f, s.baseAEAD)
 }

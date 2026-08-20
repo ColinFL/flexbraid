@@ -83,11 +83,11 @@ func (c *Client) Snapshot() Snapshot {
 		}
 		s.WANs = append(s.WANs, w)
 	}
+	c.codecMu.RLock()
 	if c.crossPath {
 		blocks = c.xenc.Stats()
 		l, r := c.xdec.Stats()
 		lost, recv = l, r
-		blocks += 0
 	} else {
 		for _, wan := range c.wans {
 			blocks += wan.enc.Stats()
@@ -99,13 +99,22 @@ func (c *Client) Snapshot() Snapshot {
 			}
 		}
 	}
+	dataShards := 0
+	if crossEnc := c.xenc; crossEnc != nil {
+		dataShards = crossEnc.Params().DataShards
+	}
+	if dataShards == 0 && len(c.wans) > 0 {
+		dataShards = c.wans[0].enc.Params().DataShards
+	}
+	crossPath := c.crossPath
+	c.codecMu.RUnlock()
 	s.FEC = FECStats{
-		CrossPath:  c.crossPath,
-		DataShards: c.cfg.FEC.DataShards,
+		CrossPath:  crossPath,
+		DataShards: dataShards,
 		BlocksSent: blocks,
 		FramesLost: lost,
 		Recovered:  recv,
-		CodingOn:   codingOn || c.crossPath,
+		CodingOn:   codingOn || crossPath,
 	}
 	s.Delivery = DeliveryStats{
 		Pending:    c.delivery.pendingCount(),

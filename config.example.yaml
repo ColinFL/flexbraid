@@ -9,8 +9,10 @@ server: 203.0.113.1:4096   # (client only) FlexBraid server address:port
 wg_peer: 127.0.0.1:51820   # (server only) inner WireGuard peer (egress target)
 session_id: auto        # "auto" (random) | <hex>; server keys sessions by this,
                         # NOT by source IP — the basis of seamless failover.
-mtu: 1388               # inner MTU. With FEC on: 1500 − 44 (frame+tag) − 68
-                        # (parity sub-header, k=10) = 1388; 1420 only with FEC off.
+mtu: 1388               # SERVER-PUSHED: set on the server; the client fetches
+                        # it at connect and enforces it on ingress. With FEC
+                        # on: 1500 − 44 (frame+tag) − 68 (parity sub-header,
+                        # k=10) = 1388; 1420 only with FEC off.
 
 # --- scheduler -----------------------------------------------------------
 scheduler:
@@ -21,6 +23,9 @@ scheduler:
                         # declare; 0 = trust the client (not recommended)
 
 # --- forward error correction (can be fully disabled) --------------------
+# SERVER-PUSHED: configure FEC on the server; each client adopts it from the
+# key-exchange ACK (its codecs are rebuilt before any data flows). Omit this
+# block on the client — any value set here is only a pre-handshake default.
 fec:
   enabled: true
   mode: adaptive        # "adaptive" | "fixed" | "off" | "crosspath"

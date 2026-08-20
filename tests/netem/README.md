@@ -12,6 +12,11 @@ and the stack (server + client + local echo) runs over loopback on one box.
    (proves the link-loss is visible end-to-end, not swallowed).
 3. **Lossy link, FEC on** — same 5% link loss with adaptive FEC: recovery to
    ≤ `EXPECT_LOSS` (default 2%) — the actual erasure-coding benefit.
+
+> FEC mode is a **server** setting (`server.yaml` decides `fec.mode`); the
+> harness restarts the stack with `mode: off` / `mode: adaptive` and the
+> client adopts the announced parameters at connect — the same behaviour a
+> real client shows.
 4. **Hard link loss** — `netem loss 100%`: tunnel goes dark, both processes
    survive (no crash under a dead path), and after the link is restored the
    tunnel recovers and traffic flows again.

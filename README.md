@@ -76,15 +76,11 @@ sudo ./flexbraid -c client.yaml
 ```
 
 ```yaml
-# client.yaml (minimal)
+# client.yaml (minimal) — FEC/MTU come from the server at connect
 mode: client
 listen: 0.0.0.0:51820     # WireGuard points here
 server: 203.0.113.1:4096
 scheduler: { mode: lb, balance_by: capacity }
-fec:
-  enabled: true
-  mode: adaptive
-  max_loss_pct: 20
 wans:
   - { id: w1, transport: udp, capacity_mbps: 300 }
   - { id: w2, transport: udp, capacity_mbps: 100 }

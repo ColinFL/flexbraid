@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions are [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Server-pushed parameters (`config.ServerAnnounce`)**: FEC geometry and
+  the inner MTU are now configured **only on the server** and announced to
+  the client in the key-exchange ACK (`KEX_ACK`). The client rebuilds its
+  codecs from the announced values before the session key is published, so
+  a client config no longer has to — and should not — copy `fec:`/`mtu:`.
+  Simpler client setups and no more "identical settings on both ends" drift.
+  A pre-announce (old) server cannot be used by a current client: the
+  handshake aborts with a "server too old" log and keeps retrying.
+
 ## [v0.1.0] — 2026-08-20
 
 First release. The full multi-WAN bonding tunnel with adaptive FEC, health

@@ -61,25 +61,27 @@ trap cleanup EXIT
 fail() { echo "!! FAIL: $*" >&2; exit 1; }
 pass() { echo "   ok:  $*"; }
 
-# ---- point the server's egress at the local echo (staging) --------------
+# ---- stack templates -----------------------------------------------------
+# FEC now lives on the SERVER config (authoritative) — the client adopts the
+# server's announce at connect, so client.yaml carries no fec/mtu here.
+server_yaml() { # $1 = server FEC mode (adaptive | off | ...)
 cat > "$LOG_DIR/server.yaml" <<EOF
 mode: server
 listen: 127.0.0.1:${SRV_PORT}
 wg_peer: 127.0.0.1:${ECHO_PORT}
+mtu: 1388
 fec:
   enabled: true
-  mode: adaptive
+  mode: $1
 crypto:
   key: netem-test-psk
 EOF
+}
 
 cat > "$LOG_DIR/client.yaml" <<EOF
 mode: client
 listen: 127.0.0.1:${CLI_PORT}
 server: 127.0.0.1:${SRV_PORT}
-fec:
-  enabled: true
-  mode: adaptive
 wans:
   - id: w1
     transport: udp
@@ -88,16 +90,25 @@ crypto:
   key: netem-test-psk
 EOF
 
-start_stack() {
+stop_stack() {
+  for pid in "${ECHO_PID:-}" "${SRV_PID:-}" "${CLI_PID:-}"; do
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  done
+  wait 2>/dev/null
+  unset ECHO_PID SRV_PID CLI_PID
+}
+
+start_stack() { # $1 = server FEC mode; idempotent (restarts everything)
+  stop_stack
+  server_yaml "$1"
   python3 tests/netem/udp-echo.py "$ECHO_PORT" > "$LOG_DIR/echo.log" 2>&1 &
   ECHO_PID=$!
-  "$BIN" -c "$LOG_DIR/server.yaml" > "$LOG_DIR/server.log" 2>&1 &
+  "$BIN" -c "$LOG_DIR/server.yaml" > "$LOG_DIR/server-${1}.log" 2>&1 &
   SRV_PID=$!
   sleep 0.3
-  "$BIN" -c "$LOG_DIR/client.yaml" > "$LOG_DIR/client.log" 2>&1 &
+  "$BIN" -c "$LOG_DIR/client.yaml" > "$LOG_DIR/client-${1}.log" 2>&1 &
   CLI_PID=$!
-  sleep 1
-  # Warm up the handshake / settle.
+  sleep 1.5   # handshake + warm-up
 }
 
 probe() {
@@ -106,8 +117,7 @@ probe() {
 
 # ---- test 1: baseline -----------------------------------------------------
 echo "== baseline (no netem) =="
-start_stack
-sleep 1.5
+start_stack adaptive
 out=$(probe) || fail "baseline probe crashed ($out)"
 echo "   $out"
 loss=$(echo "$out" | sed -E 's/.*loss=([0-9.]+)%.*/\1/')
@@ -115,46 +125,35 @@ if awk "BEGIN{exit !($loss > 0.0)}"; then
   fail "baseline loss ${loss}% > 0 (loopback should be ~0)"
 fi
 pass "baseline loss ${loss}%"
-kill "$CLI_PID" "$SRV_PID" "$ECHO_PID" 2>/dev/null; wait 2>/dev/null
-unset CLI_PID SRV_PID ECHO_PID
 
 # ---- tests 2+3: lossy link, FEC off vs on ---------------------------------
+# FEC is a SERVER setting now: switch modes by restarting the stack with a
+# different server.yaml (the client re-adopts at connect). netem loss stays
+# applied across both subtests.
 echo "== lossy link (netem loss 5%) =="
 tc qdisc replace dev "$IF" root netem loss 5%
 NETEM_APPLIED=1
-start_stack
-sleep 1.5
-# FEC off: expect loss ~5%
-sed -i 's/mode: adaptive/mode: off/' "$LOG_DIR/client.yaml"
-kill "$CLI_PID" 2>/dev/null; wait "$CLI_PID" 2>/dev/null
-"$BIN" -c "$LOG_DIR/client.yaml" > "$LOG_DIR/client-nofec.log" 2>&1 &
-CLI_PID=$!
-sleep 1.5
+# FEC off on the server => the tunnel carries the raw netem loss (~5%)
+start_stack off
 out=$(probe); echo "   FEC-off: $out"
 loss=$(echo "$out" | sed -E 's/.*loss=([0-9.]+)%.*/\1/')
 if awk "BEGIN{exit !($loss < 1.0)}"; then
   fail "FEC-off on 5% loss gave ${loss}% loss (expected ~5%+): $out"
 fi
 pass "FEC-off sees link loss (${loss}%)"
-# FEC on: expect loss < EXPECT_LOSS
-sed -i 's/mode: off/mode: adaptive/' "$LOG_DIR/client.yaml"
-kill "$CLI_PID" 2>/dev/null; wait "$CLI_PID" 2>/dev/null
-"$BIN" -c "$LOG_DIR/client.yaml" > "$LOG_DIR/client-fec.log" 2>&1 &
-CLI_PID=$!
-sleep 1.5
+# FEC on (adaptive) => loss recovered to <= EXPECT_LOSS
+start_stack adaptive
 out=$(probe); echo "   FEC-on: $out"
 loss=$(echo "$out" | sed -E 's/.*loss=([0-9.]+)%.*/\1/')
 if awk "BEGIN{exit !($loss > $EXPECT_LOSS)}"; then
   fail "FEC-on on 5% loss lost ${loss}% (expected ≤${EXPECT_LOSS}%): $out"
 fi
 pass "FEC recovers link loss (${loss}% ≤ ${EXPECT_LOSS}%)"
-kill "$CLI_PID" "$SRV_PID" "$ECHO_PID" 2>/dev/null; wait 2>/dev/null
-unset CLI_PID SRV_PID ECHO_PID
 
 # ---- test 4: hard link loss (netem 100%) -> survive + bounded -------------
 echo "== hard link loss (netem loss 100%) =="
 tc qdisc replace dev "$IF" root netem loss 100%
-start_stack
+start_stack adaptive
 sleep 1.5
 out=$(probe); echo "   while dark: $out"
 loss=$(echo "$out" | sed -E 's/.*loss=([0-9.]+)%.*/\1/')
@@ -179,7 +178,7 @@ unset CLI_PID SRV_PID ECHO_PID
 # ---- test 5: jitter/delay ------------------------------------------------
 echo "== delay+jitter (netem delay 30ms 10ms) =="
 tc qdisc replace dev "$IF" root netem delay 30ms 10ms
-start_stack
+start_stack adaptive
 sleep 1.5
 out=$(probe); echo "   $out"
 rtt_avg=$(echo "$out" | sed -E 's/.*avg=([0-9.]+).*/\1/')

@@ -7,6 +7,9 @@ listen: 0.0.0.0:4096           # public UDP port (see README)
 session_id: auto               # auto | <hex> fixed ID (stable multi-client)
 wg_peer: 127.0.0.1:51820     # inner WireGuard peer this trunk egresses to
 
+# FEC and MTU are SERVER-AUTHORITATIVE: announced to every client in the
+# key-exchange ACK (the client adopts them — see docs/CONFIG.md).
+mtu: 1388                      # inner MTU pushed to clients (1388 for k=10)
 fec:
   enabled: true
   mode: adaptive             # adaptive | fixed | off | crosspath

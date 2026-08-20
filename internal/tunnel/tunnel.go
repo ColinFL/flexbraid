@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/cipher"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -131,10 +132,25 @@ type Client struct {
 	// Cross-path FEC (fec.mode: crosspath): ONE codec shared by every WAN;
 	// blocks are spread across all usable paths (scheduler.PickWRR) and the
 	// decoder keys them by session only, so frames from different paths
-	// assemble into the same block (docs/DESIGN.md §6.4).
+	// assemble into the same block (docs/DESIGN.md §6.4). The FEC geometry
+	// and inner MTU are SERVER-AUTHORITATIVE: the server announces them in
+	// the KEX_ACK and the client rebuilds its codecs before the session key
+	// is published, so every data frame uses the server's parameters
+	// (config.ServerAnnounce).
+	//
+	// codecMu guards the codec slots (crossPath, xenc/xdec, per-WAN enc/dec)
+	// and the effective MTU. Readers snapshot the pointers they need under
+	// RLock and use them after; writers only ever REPLACE whole codec objects
+	// (never mutate in place), so a reader that grabbed the previous codec
+	// finishes that one frame/tick with it — the swap applies from the next.
+	codecMu   sync.RWMutex
 	crossPath bool
 	xenc      *fec.Encoder
 	xdec      *fec.Decoder
+	// mtu is the effective inner MTU (atomic: read on the ingress hot path).
+	// Initialized from cfg.MTU at NewClient, replaced by the server's value
+	// on handshake. cfg.MTU stays as the config-file value for reload/log.
+	mtu atomic.Int64
 
 	// sendErrs throttles repeated send-failure logging (P6).
 	sendErrs atomic.Uint64
@@ -372,6 +388,7 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		clientPub:     clientPub,
 		start:         time.Now(),
 	}
+	c.mtu.Store(int64(cfg.MTU))
 	// Cross-path FEC shares one codec across all WANs (blocks span every
 	// path; per-WAN codecs would never see a full block). Per-WAN FEC
 	// (adaptive/fixed) keeps one codec per WAN.
@@ -700,9 +717,12 @@ func (c *Client) setSessionAEAD(a cipher.AEAD) {
 }
 
 // handleKexAck processes the server's key-exchange ACK (M5.5): it carries
-// the server's ephemeral X25519 public key sealed under the base (PSK) key.
-// The client derives the forward-secret session key and publishes it.
-// Returns true if the ACK authenticated.
+// the server's ephemeral X25519 public key sealed under the base (PSK) key,
+// followed by the server's authoritative FEC/MTU announce. The client
+// derives the forward-secret session key, rebuilds its codecs from the
+// announced parameters (so both ends code identically), and only then
+// publishes the session key — no data frame can pass the PFS gate until the
+// codecs match the server's. Returns true if the ACK authenticated.
 func (c *Client) handleKexAck(sealed []byte) bool {
 	plain, err := crypto.Open(c.baseAEAD, crypto.DirServerToClient, sealed)
 	if err != nil {
@@ -727,11 +747,91 @@ func (c *Client) handleKexAck(sealed []byte) bool {
 	if err != nil {
 		return false
 	}
+	// Rebuild FEC codecs + effective MTU from the server's announce BEFORE
+	// publishing the session key. A bad/missing announce aborts the handshake
+	// (the client keeps re-sending FIRST until a valid ACK arrives) rather
+	// than risking a codec mismatch for the whole session.
+	if err := c.applyAnnounce(f.Payload[crypto.PublicKeySize:]); err != nil {
+		c.log.Warn("rejecting server parameters",
+			"session", fmt.Sprintf("%016x", uint64(c.sess.ID)), "error", err)
+		return false
+	}
 	c.setSessionAEAD(aead)
 	c.log.Info("session established",
 		"session", fmt.Sprintf("%016x", uint64(c.sess.ID)),
-		"key_exchange", "x25519-pfs")
+		"key_exchange", "x25519-pfs",
+		"fec_mode", c.cfg.FEC.Mode, // server values now in effect on codecs
+		"mtu", c.mtu.Load())
 	return true
+}
+
+// applyAnnounce adopts the server's authoritative FEC + inner MTU: it
+// rebuilds every codec slot from the announced parameters under codecMu.
+// The geometry must be byte-identical to the server's own, which is exactly
+// what the server pushes (it marshals the same validated config its codecs
+// were built from). Per-WAN fec_max_loss_pct overrides from the client's
+// own WAN entries survive: they only size the client's encoder capacity —
+// parity is self-describing, so the server's decoder does not need them.
+// Returns an error for a malformed announce, an unknown version, or a
+// geometry the validated config would refuse; the caller aborts the
+// handshake rather than start the session on mismatched codecs.
+func (c *Client) applyAnnounce(data []byte) error {
+	var ann config.ServerAnnounce
+	if len(data) == 0 {
+		return fmt.Errorf("server sent no parameters block (server too old?)")
+	}
+	if err := json.Unmarshal(data, &ann); err != nil {
+		return fmt.Errorf("malformed server parameters: %w", err)
+	}
+	if ann.Version != config.AnnounceVersion {
+		return fmt.Errorf("unsupported server parameters version %d (this client speaks v%d)",
+			ann.Version, config.AnnounceVersion)
+	}
+	// Feasibility check: re-derive the codec params exactly as the server
+	// would (same function fecParamsFor). A temp config carries only the
+	// announced FEC + MTU; cfg.Validate's MTU range is folded into
+	// fecParamsFor's own checks.
+	tmp := &config.Config{FEC: ann.FEC, MTU: ann.MTU}
+	c.codecMu.Lock()
+	defer c.codecMu.Unlock()
+
+	c.crossPath = ann.FEC.Mode == config.FECCrosspath
+	if c.crossPath {
+		// One shared codec across all WANs (wan-independent).
+		p, err := fecParamsFor(tmp, nil)
+		if err != nil {
+			return fmt.Errorf("server FEC parameters invalid: %w", err)
+		}
+		if c.xenc, err = fec.NewEncoder(p); err != nil {
+			return fmt.Errorf("adopt server cross-path FEC: %w", err)
+		}
+		if c.xdec, err = fec.NewDecoder(p); err != nil {
+			return fmt.Errorf("adopt server cross-path FEC: %w", err)
+		}
+	} else {
+		// Per-WAN codecs (adaptive/fixed/off), one per WAN.
+		for i, wan := range c.wans {
+			p, err := fecParamsFor(tmp, &c.cfg.WANs[i])
+			if err != nil {
+				return fmt.Errorf("server FEC parameters invalid: %w", err)
+			}
+			wan.enc, err = fec.NewEncoder(p)
+			if err != nil {
+				return fmt.Errorf("adopt server FEC for %s: %w", wan.id, err)
+			}
+			wan.dec, err = fec.NewDecoder(p)
+			if err != nil {
+				return fmt.Errorf("adopt server FEC for %s: %w", wan.id, err)
+			}
+		}
+	}
+	c.mtu.Store(int64(ann.MTU))
+	c.log.Info("adopted server parameters",
+		"fec_enabled", ann.FEC.Enabled,
+		"fec_mode", ann.FEC.Mode,
+		"data_shards", ann.FEC.DataShards,
+		"mtu", ann.MTU)
+	return nil
 }
 
 // send seals and transmits one frame on a WAN. P4: the WAN's sendMu is held
@@ -828,7 +928,7 @@ func (c *Client) noteOversize(n int) {
 	m := c.oversizeErrs.Add(1)
 	if m == 1 || m%100 == 0 {
 		c.log.Warn("dropped oversize inner datagram (mtu exceeded)",
-			"bytes", n, "mtu", c.cfg.MTU, "count", m)
+			"bytes", n, "mtu", c.mtu.Load(), "count", m)
 	}
 }
 
@@ -872,10 +972,10 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 			}
 			c.sess.SetWGAddr(addr)
 		}
-		// Defense-in-depth: the config validation (fecParamsFor) already
-		// bounds the MTU; drop anything that still exceeds it instead of
-		// letting an oversized frame hit the WAN.
-		if n > c.cfg.MTU {
+		// Defense-in-depth: the effective MTU (server-adopted after the
+		// handshake) bounds the frame; drop anything larger than it instead
+		// of letting an oversized frame hit the WAN.
+		if n > int(c.mtu.Load()) {
 			c.noteOversize(n)
 			continue
 		}
@@ -893,12 +993,20 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 			Seq:       c.sess.NextSeq(), // before Push: sub-header records true seqs
 			Payload:   payload,
 		}
-		if c.crossPath {
+		// Snapshot the codec slots under codecMu. The swap on handshake only
+		// replaces whole codec objects, so finishing this frame on the
+		// previous codec is safe — everything after the swap uses the
+		// server's geometry.
+		c.codecMu.RLock()
+		crossPath := c.crossPath
+		xenc := c.xenc
+		c.codecMu.RUnlock()
+		if crossPath {
 			// Cross-path FEC: code the block globally, then spread its
 			// frames over every usable WAN (smooth WRR). Blocks are keyed
 			// by session on the receiver, so the WAN a frame travelled is
 			// irrelevant to reassembly — only the surviving share matters.
-			if frames := c.xenc.Push(f); len(frames) > 0 {
+			if frames := xenc.Push(f); len(frames) > 0 {
 				c.sendCrossEncoded(frames)
 			}
 			continue
@@ -909,7 +1017,10 @@ func (c *Client) ingressLoop(ctx context.Context) error {
 			continue
 		}
 		wan := c.byWAN[wanID]
-		c.sendEncoded(wan, wan.enc.Push(f))
+		c.codecMu.RLock()
+		enc := wan.enc
+		c.codecMu.RUnlock()
+		c.sendEncoded(wan, enc.Push(f))
 	}
 }
 
@@ -949,7 +1060,10 @@ func (c *Client) recvLoop(wan *wanLink) {
 		if f.HasFlag(frame.FlagControl) || f.HasFlag(frame.FlagKeepalive) || len(f.Payload) == 0 {
 			continue
 		}
-		c.deliverToWG(c.delivery.Push(wan.dec.Push(wan.id, f)))
+		c.codecMu.RLock()
+		dec := wan.dec
+		c.codecMu.RUnlock()
+		c.deliverToWG(c.delivery.Push(dec.Push(wan.id, f)))
 	}
 }
 
@@ -969,7 +1083,9 @@ func (c *Client) deliverToWG(frames []*frame.Frame) {
 // fecTickLoop flushes short FEC blocks on every WAN (both directions) and
 // advances the delivery buffer's gap timer.
 func (c *Client) fecTickLoop(ctx context.Context) {
+	c.codecMu.RLock()
 	interval := c.wans[0].enc.Params().BlockTimeout / 2
+	c.codecMu.RUnlock()
 	if interval < time.Millisecond {
 		interval = time.Millisecond
 	}
@@ -980,15 +1096,22 @@ func (c *Client) fecTickLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			if c.crossPath {
+			c.codecMu.RLock()
+			crossPath := c.crossPath
+			xenc, xdec := c.xenc, c.xdec
+			c.codecMu.RUnlock()
+			if crossPath {
 				// One shared codec: single flush for encoder and decoder.
-				c.sendCrossEncoded(c.xenc.Tick(now))
-				c.deliverToWG(c.delivery.Push(c.xdec.Tick(now)))
+				c.sendCrossEncoded(xenc.Tick(now))
+				c.deliverToWG(c.delivery.Push(xdec.Tick(now)))
 				continue
 			}
 			for _, wan := range c.wans {
-				c.sendEncoded(wan, wan.enc.Tick(now))
-				c.deliverToWG(c.delivery.Push(wan.dec.Tick(now)))
+				c.codecMu.RLock()
+				enc, dec := wan.enc, wan.dec
+				c.codecMu.RUnlock()
+				c.sendEncoded(wan, enc.Tick(now))
+				c.deliverToWG(c.delivery.Push(dec.Tick(now)))
 			}
 			c.deliverToWG(c.delivery.Tick(now))
 		}
@@ -1008,9 +1131,12 @@ func (c *Client) healthTickLoop(ctx context.Context) {
 			return
 		case now := <-t.C:
 			for _, wan := range c.wans {
+				c.codecMu.RLock()
+				enc, dec := wan.enc, wan.dec
+				c.codecMu.RUnlock()
 				// In-band signal: unrecovered loss on this path, measured
 				// from real traffic. Instant under load — no probe latency.
-				if lost, received := wan.dec.TakeStreamStats(uint64(c.sess.ID), wan.id); received > 0 {
+				if lost, received := dec.TakeStreamStats(uint64(c.sess.ID), wan.id); received > 0 {
 					rate := float64(lost) / float64(lost+received)
 					if rate > 0 {
 						wan.health.ObserveInBand(rate)
@@ -1018,7 +1144,7 @@ func (c *Client) healthTickLoop(ctx context.Context) {
 				}
 				// Adaptive FEC: feed the encoder this path's loss estimate
 				// so it can code/pass-through accordingly (fec.Params.Adaptive).
-				wan.enc.SetLossRate(wan.health.Loss())
+				enc.SetLossRate(wan.health.Loss())
 				before := wan.health.State()
 				wan.health.Tick(now)
 				after := wan.health.State()

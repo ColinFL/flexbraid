@@ -493,6 +493,17 @@ so new wire formats are drop-in.
      nonce is never reused across sessions — and because the ephemeral
      secrets are discarded at process exit, a later PSK compromise cannot
      decrypt past sessions (forward secrecy).
+  5. The `KEX_ACK` additionally carries the server's **authoritative FEC +
+     MTU announce** (JSON, after the server public key, inside the same
+     base-key-sealed frame — see `config.ServerAnnounce`). FEC geometry
+     and the inner MTU must be byte-identical on both ends for the codecs
+     to interoperate, so the server is the single source of truth: the
+     client rebuilds its codecs from the announced values *before* the
+     session key is published, so no data frame can be coded with
+     mismatched parameters. A client config therefore omits `fec`/`mtu`
+     entirely; a pre-announce server cannot be used by a current client
+     (the handshake aborts with a clear "server too old" log and the client
+     keeps retrying).
   There is **no unauthenticated \"ephemeral key from server\" path**: the
   PSK binding in the HKDF salt and the base-key-sealed handshake are what
   stop a MITM impersonating either side.

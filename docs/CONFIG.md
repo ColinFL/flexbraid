@@ -10,6 +10,39 @@ disables a feature.
 > binding, in-band loss telemetry, silence watchdog, live-adaptive and
 > cross-path FEC, `udp` + `faketcp` wire formats.
 
+## Server-pushed parameters (FEC + MTU)
+
+The **server is the single source of truth** for the FEC geometry and the
+inner MTU. These values must be byte-identical on both ends for the codecs
+to interoperate, so instead of copying them into the client config they are
+announced by the server in the key-exchange ACK and the client adopts them
+at connect:
+
+- `fec.*` — **server only.** Configure FEC on the server; the client codecs
+  are rebuilt from the announced parameters before any data frame flows.
+- `mtu` — **server only.** The announced inner MTU is what the client
+  enforces on its ingress (`WireGuard` interface MTU must be set to it).
+
+A client config therefore **should not** set `fec:` or `mtu:` at all — any
+values it sets are used only as a pre-handshake default and are immediately
+replaced by the server's. Omitting them on the client is the intended,
+simplified configuration:
+
+```yaml
+mode: client
+listen: 0.0.0.0:51820
+server: 203.0.113.1:4096
+wans:
+  - id: w1
+    transport: udp
+    capacity_mbps: 300
+crypto:
+  key: "change-me"
+```
+
+Tail the client log to see what it adopted: `session established
+fec_mode=... mtu=...`.
+
 ---
 
 ## Root keys
@@ -22,9 +55,10 @@ server: 203.0.113.1:4096   # (client only) server address:port
 wg_peer: 127.0.0.1:51820   # (server only) inner WireGuard peer (egress target)
 session_id: auto      # "auto" (random) | <hex>. Server keys sessions by this,
                       # NOT by source IP — this is what makes failover seamless.
-mtu: 1388             # inner MTU. With FEC on: 1500 − 44 (frame+AEAD) − 68
-                      # (parity sub-header, k=10) = 1388; 1420 only with FEC
-                      # off. Validated at startup.
+mtu: 1388             # SERVER-PUSHED (server only). Inner MTU; the server
+                      # announces it to clients at connect. With FEC on:
+                      # 1500 − 44 (frame+AEAD) − 68 (parity sub-header,
+                      # k=10) = 1388; 1420 only with FEC off.
 scheduler: {...}
 fec: {...}
 wans: [ ... ]
@@ -70,6 +104,10 @@ scheduler:
 ---
 
 ## `fec` (forward error correction — **can be fully disabled**)
+
+> **Server-pushed.** Configure this on the **server**; the client fetches it
+> in the key-exchange ACK and rebuilds its codecs before any data flows. A
+> client may omit `fec:` entirely (see "Server-pushed parameters" above).
 
 ```yaml
 fec:

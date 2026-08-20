@@ -114,6 +114,28 @@ type Config struct {
 	Transport TransportMode `yaml:"transport"`
 }
 
+// AnnounceVersion is the wire format of ServerAnnounce. Bump it on any
+// incompatible layout change; the client refuses announces with a version it
+// does not understand rather than guessing at field meanings.
+const AnnounceVersion = 1
+
+// ServerAnnounce is the parameter block the server pushes to the client in
+// the key-exchange ACK (in addition to the ephemeral server X25519 key). The
+// FEC geometry and the inner MTU must be byte-identical on both ends for
+// the codecs to interoperate — if the two ends coded differently, parity
+// blocks could never be reassembled. The server is therefore the single
+// source of truth: the client replaces its own FEC/MTU with the announced
+// values before any data frame is accepted, so a client config no longer has
+// to (and should not) duplicate them.
+//
+// JSON, sealed inside the base-key-authenticated KEX_ACK frame; only a party
+// holding the PSK can forge it.
+type ServerAnnounce struct {
+	Version int `json:"v"`   // AnnounceVersion
+	MTU     int `json:"mtu"` // inner MTU (default 1420), validated against FEC
+	FEC     FEC `json:"fec"` // validated/defaulted FEC configuration
+}
+
 // Sched configures the packet scheduler / load balancer.
 type Sched struct {
 	Mode      SchedulerMode `yaml:"mode"`
