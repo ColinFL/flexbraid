@@ -140,6 +140,44 @@ func New(opts Options) *Monitor {
 	}
 }
 
+// Reload applies new tuning options at runtime (M5.2 reload). The circuit
+// breaker keeps its current state, loss/RTT/jitter estimates and miss
+// counters — only the weights and thresholds change. Zero values fall back
+// to the same defaults as New.
+func (m *Monitor) Reload(opts Options) {
+	if opts.MaxLoss <= 0 || opts.MaxLoss >= 1 {
+		opts.MaxLoss = m.maxLoss // keep current if zero
+	}
+	if opts.DegradeAfter <= 0 {
+		opts.DegradeAfter = m.degradeAft
+	}
+	if opts.RecoverAfter <= 0 {
+		opts.RecoverAfter = m.recoverAft
+	}
+	if opts.DownAfterMisses <= 0 {
+		opts.DownAfterMisses = m.downAftMiss
+	}
+	if opts.LossAlphaFast <= 0 || opts.LossAlphaFast >= 1 {
+		opts.LossAlphaFast = m.alphaFast
+	}
+	if opts.LossAlphaSlow <= 0 || opts.LossAlphaSlow >= 1 {
+		opts.LossAlphaSlow = m.alphaSlow
+	}
+	if opts.JitterAlpha <= 0 || opts.JitterAlpha >= 1 {
+		opts.JitterAlpha = m.jitterAlpha
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxLoss = opts.MaxLoss
+	m.degradeAft = opts.DegradeAfter
+	m.recoverAft = opts.RecoverAfter
+	m.downAftMiss = opts.DownAfterMisses
+	m.downGrace = opts.DownGrace
+	m.alphaFast = opts.LossAlphaFast
+	m.alphaSlow = opts.LossAlphaSlow
+	m.jitterAlpha = opts.JitterAlpha
+}
+
 // ObserveSample records one probe outcome: loss is 0 (answered) or 1
 // (missed). A positive rtt updates the RTT/jitter estimates. Only a genuine
 // response (rtt > 0) resets the missed-probe counter and hard-resets a DOWN

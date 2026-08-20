@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ColinFL/flexbraid/internal/frame"
@@ -129,6 +130,9 @@ type Encoder struct {
 	codingOn    bool    // current decision: code vs pass-through
 	codingSince time.Time
 	rsParity    int // parity shards the current rs encoder was built with
+
+	// blocksCoded counts every block finalized by this encoder (telemetry).
+	blocksCoded atomic.Uint64
 }
 
 // NewEncoder builds an RS encoder for the given params.
@@ -303,6 +307,7 @@ func (e *Encoder) Tick(now time.Time) []*frame.Frame {
 	// Short block: emit the collected data frames without parity. The
 	// decoder cannot reconstruct anything, but it must not wait forever.
 	e.block++
+	e.blocksCoded.Add(1)
 	bs := e.block
 	out := e.pending
 	for _, f := range out {
@@ -318,6 +323,7 @@ func (e *Encoder) Tick(now time.Time) []*frame.Frame {
 // adaptive mode), not the configured ceiling.
 func (e *Encoder) emitBlock() []*frame.Frame {
 	e.block++
+	e.blocksCoded.Add(1)
 	bs := e.block
 	data := e.pending
 	e.pending = nil
@@ -432,6 +438,8 @@ type Decoder struct {
 	lastFlushed map[streamKey]uint32
 	// stats accumulates per-stream loss counters for TakeStreamStats.
 	stats map[streamKey]streamStat
+	// recovered counts data frames reconstructed from parity (telemetry).
+	recovered atomic.Uint64
 }
 
 // rsFor returns (caching) an RS encoder for the block's actual shard count.
@@ -632,6 +640,7 @@ func (d *Decoder) reconstruct(key blockKey, st *blockState) []*frame.Frame {
 			payload := make([]byte, st.lens[i])
 			copy(payload, shards[i][:st.lens[i]])
 			st.data[seq] = payload
+			d.recovered.Add(1)
 		}
 	}
 	return d.flush(key, st)
@@ -706,4 +715,26 @@ func (d *Decoder) TakeStreamStats(sessionID uint64, path string) (lost, received
 	s := d.stats[streamKey{sessionID: sessionID, path: path}]
 	d.stats[streamKey{sessionID: sessionID, path: path}] = streamStat{}
 	return s.lost, s.received
+}
+
+// Stats returns encoder-side counters for telemetry.
+func (e *Encoder) Stats() (blocksCoded uint64) { return e.blocksCoded.Load() }
+
+// Stats returns decoder-side counters for telemetry: frames unrecoverably
+// lost (summed across streams) and frames rebuilt from parity.
+func (d *Decoder) Stats() (lost, recovered uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, s := range d.stats {
+		lost += s.lost
+	}
+	return lost, d.recovered.Load()
+}
+
+// CodingOn reports whether the encoder currently emits parity frames
+// (telemetry: live-adaptive pass-through shows false on clean links).
+func (e *Encoder) CodingOn() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.codingOn
 }

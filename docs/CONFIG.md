@@ -284,6 +284,51 @@ log:
 
 ---
 
+## `telemetry` (M5.1)
+
+Both knobs default to **off** — a firewall box stays quiet unless you opt in.
+
+```yaml
+telemetry:
+  listen: "127.0.0.1:9080"  # empty = off (no HTTP endpoint)
+  path: /stats               # HTTP path for the JSON snapshot (default /stats)
+  interval_sec: 0            # >0: periodic JSON snapshot via structured log
+```
+
+- The HTTP endpoint has **no auth** — bind it to loopback or a management
+  network, never to an unbounded public address.
+- The snapshot shape (JSON field names) is pinned by tests
+  (`internal/tunnel/stats_test.go`): `mode`, `uptime_sec`, `wans[]`
+  (id/transport/state/loss_pct/rtt_ms/jitter_ms/capacity_mbps/frames_sent/
+  pongs/missed_probes/last_rx_age_ms), `fec` (cross_path/data_shards/
+  blocks_sent/frames_lost/recovered/coding_on), `delivery` (pending/
+  max_pending/drops). Server snapshots add `sessions`.
+
+---
+
+## Runtime reload (M5.2)
+
+Send **SIGHUP** to a running `flexbraid` to re-read the config file. The
+following are applied **live**:
+
+- `scheduler` capacities (`wans[].capacity_mbps`) — reweights load balancing
+- `delivery.gap_timeout_ms`, `delivery.max_pending`
+- the whole `health` section (EWMA weights, thresholds, probe counts)
+- `log.level`
+
+Changes that would rebind sockets or renegotiate crypto are **rejected**
+with `reload: change requires restart` and the process keeps its previous
+settings: `listen`, `server`, `wg_peer`, `session_id`, `mtu`, `transport`,
+`crypto`, the WAN **topology** (ids/transports/interfaces), FEC mode
+(crosspath vs per-WAN) and scheduler mode/affinity/balance_by. Apply those
+by restarting.
+
+On a firewall you enable the service with the reload trigger via:
+`kill -HUP $(cat /var/run/flexbraid.pid)` (rc.d) or
+`systemctl kill -s HUP flexbraid` (Debian).
+
+---
+
 ## Reserved (parsed, not yet used)
 
 - `session_id` — the client currently always generates a random session ID;

@@ -92,19 +92,20 @@ const (
 
 // Config is the root configuration document.
 type Config struct {
-	Mode      Mode     `yaml:"mode"`
-	Listen    string   `yaml:"listen"`
-	Server    string   `yaml:"server"`
-	WGPeer    string   `yaml:"wg_peer"`    // server mode: inner WireGuard peer (egress)
-	SessionID string   `yaml:"session_id"` // auto | <hex> (server keys sessions by this, not source IP)
-	Scheduler Sched    `yaml:"scheduler"`
-	FEC       FEC      `yaml:"fec"`
-	MTU       int      `yaml:"mtu"` // inner MTU advertised to WireGuard (default 1420)
-	WANs      []WAN    `yaml:"wans"`
-	Delivery  Delivery `yaml:"delivery"`
-	Health    Health   `yaml:"health"`
-	Crypto    Crypto   `yaml:"crypto"`
-	Log       Log      `yaml:"log"`
+	Mode      Mode      `yaml:"mode"`
+	Listen    string    `yaml:"listen"`
+	Server    string    `yaml:"server"`
+	WGPeer    string    `yaml:"wg_peer"`    // server mode: inner WireGuard peer (egress)
+	SessionID string    `yaml:"session_id"` // auto | <hex> (server keys sessions by this, not source IP)
+	Scheduler Sched     `yaml:"scheduler"`
+	FEC       FEC       `yaml:"fec"`
+	MTU       int       `yaml:"mtu"` // inner MTU advertised to WireGuard (default 1420)
+	WANs      []WAN     `yaml:"wans"`
+	Delivery  Delivery  `yaml:"delivery"`
+	Health    Health    `yaml:"health"`
+	Crypto    Crypto    `yaml:"crypto"`
+	Log       Log       `yaml:"log"`
+	Telemetry Telemetry `yaml:"telemetry"`
 
 	// Transport is the server-side wire format ("udp" default | "faketcp").
 	// Clients pick a per-WAN transport instead (wans[].transport).
@@ -196,6 +197,20 @@ type Crypto struct {
 type Log struct {
 	Level string `yaml:"level"` // debug|info|warn|error
 	File  string `yaml:"file"`
+}
+
+// Telemetry exposes runtime stats (M5.1). Both knobs default to off so a
+// firewall box stays quiet unless the operator opts in.
+type Telemetry struct {
+	// Listen enables an HTTP server exposing the JSON snapshot at Path
+	// (default "/stats"). Empty = off. Recommend binding to a loopback or
+	// management address only — the endpoint has no auth.
+	Listen string `yaml:"listen"`
+	// Path is the HTTP path for the JSON snapshot (default "/stats").
+	Path string `yaml:"path"`
+	// IntervalSec > 0 logs the JSON snapshot periodically via slog
+	// (structured log, key "telemetry"). 0 = off.
+	IntervalSec float64 `yaml:"interval_sec"`
 }
 
 // Load reads and parses a YAML config file, then validates it.
@@ -438,6 +453,17 @@ func (c *Config) Validate() error {
 
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
+	}
+	if c.Telemetry.Path == "" {
+		c.Telemetry.Path = "/stats"
+	}
+	if c.Telemetry.IntervalSec < 0 {
+		return fmt.Errorf("telemetry.interval_sec must be >= 0, got %v", c.Telemetry.IntervalSec)
+	}
+	if c.Telemetry.Listen != "" {
+		if _, _, err := net.SplitHostPort(c.Telemetry.Listen); err != nil {
+			return fmt.Errorf("telemetry.listen must be host:port, got %q", c.Telemetry.Listen)
+		}
 	}
 	return nil
 }

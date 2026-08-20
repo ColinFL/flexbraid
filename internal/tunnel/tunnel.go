@@ -126,6 +126,8 @@ type Client struct {
 	noWANErrs atomic.Uint64
 
 	ingress *net.UDPConn // read-only after Start
+	// start marks construction time (telemetry uptime).
+	start time.Time
 }
 
 // pathMTU is the assumed WAN path MTU for the inner-MTU check. The largest
@@ -346,6 +348,7 @@ func NewClient(cfg *config.Config, log *slog.Logger) (*Client, error) {
 		byWAN:         make(map[string]*wanLink),
 		sched:         scheduler.New(schedulerOptions(cfg)),
 		probeInterval: probeInterval,
+		start:         time.Now(),
 	}
 	// Cross-path FEC shares one codec across all WANs (blocks span every
 	// path; per-WAN codecs would never see a full block). Per-WAN FEC

@@ -90,3 +90,17 @@ crypto:
 log:
   level: info   # debug | info | warn | error
   file: ""
+
+# --- telemetry (M5.1) -----------------------------------------------------
+# Both knobs default to off; a firewall box stays quiet unless you opt in.
+telemetry:
+  listen: ""          # "127.0.0.1:9080" — HTTP JSON snapshot. Empty = off.
+  path: /stats        # HTTP path (only used when listen is set; no auth)
+  interval_sec: 0     # >0: periodic JSON snapshot via structured log. 0 = off.
+
+# --- runtime reload (M5.2) --------------------------------------------------
+# Send SIGHUP to re-read this file. Applied live: scheduler capacities,
+# delivery gap_timeout/max_pending, health tuning, log level. Structural
+# changes (listeners, transports, crypto key, WAN topology, FEC mode,
+# scheduler mode) require a restart — the reload is rejected and the
+# previous settings stay in force.

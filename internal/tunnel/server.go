@@ -85,6 +85,8 @@ type Server struct {
 	egressWG sync.WaitGroup
 	// sendErrs throttles repeated send-failure logging (P6).
 	sendErrs atomic.Uint64
+	// start marks construction time (telemetry uptime).
+	start time.Time
 
 	// states holds per-session scheduling state (guarded by statesMu).
 	statesMu sync.Mutex
@@ -142,6 +144,7 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		fecParams: params,
 		fecDec:    fecDec,
 		states:    make(map[session.ID]*sessState),
+		start:     time.Now(),
 	}, nil
 }
 

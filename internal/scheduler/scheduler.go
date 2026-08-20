@@ -83,6 +83,30 @@ type Scheduler struct {
 	rng *rand.Rand
 }
 
+// PathInfo is a read-only snapshot of one path for telemetry.
+type PathInfo struct {
+	ID           string  `json:"id"`
+	CapacityMbps float64 `json:"capacity_mbps"`
+	State        string  `json:"state"`
+	Loss         float64 `json:"loss"`
+}
+
+// Paths returns a read-only snapshot of every registered path (telemetry).
+func (s *Scheduler) Paths() []PathInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]PathInfo, 0, len(s.paths))
+	for _, p := range s.paths {
+		out = append(out, PathInfo{
+			ID:           p.id,
+			CapacityMbps: p.capacity,
+			State:        p.state.String(),
+			Loss:         p.loss,
+		})
+	}
+	return out
+}
+
 // New builds a scheduler from options.
 func New(opts Options) *Scheduler {
 	if opts.Mode == "" {

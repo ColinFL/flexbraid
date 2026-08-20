@@ -26,7 +26,8 @@ type deliveryBuffer struct {
 	pending    map[uint32]*frame.Frame
 	gapSince   time.Time // when next became missing (zero = no gap)
 	gapTimeout time.Duration
-	maxPending int // BDP guard: drop-oldest bound on pending
+	maxPending int    // BDP guard: drop-oldest bound on pending
+	drops      uint64 // total frames dropped (BDP guard, telemetry)
 }
 
 func newDeliveryBuffer(gapTimeout time.Duration, maxPending int) *deliveryBuffer {
@@ -42,6 +43,32 @@ func newDeliveryBuffer(gapTimeout time.Duration, maxPending int) *deliveryBuffer
 		gapTimeout: gapTimeout,
 		maxPending: maxPending,
 	}
+}
+
+// Reload applies new tuning at runtime (M5.2 reload): gap timeout and the
+// pending-buffer bound take effect immediately; buffered frames are kept.
+func (d *deliveryBuffer) Reload(gapTimeout time.Duration, maxPending int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if gapTimeout > 0 {
+		d.gapTimeout = gapTimeout
+	}
+	if maxPending > 0 {
+		d.maxPending = maxPending
+	}
+}
+
+// pendingCount and dropsTotal return delivery-buffer telemetry.
+func (d *deliveryBuffer) pendingCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.pending)
+}
+
+func (d *deliveryBuffer) dropsTotal() uint64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.drops
 }
 
 // Push accepts decoded frames (any order) and returns those that can be
@@ -72,6 +99,7 @@ func (d *deliveryBuffer) Push(frames []*frame.Frame) []*frame.Frame {
 						}
 					}
 					delete(d.pending, lo)
+					d.drops++
 				}
 				d.pending[f.Seq] = f
 			}
