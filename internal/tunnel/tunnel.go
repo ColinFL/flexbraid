@@ -835,6 +835,18 @@ func (c *Client) applyAnnounce(data []byte) error {
 		if c.xdec, err = fec.NewDecoder(p); err != nil {
 			return fmt.Errorf("adopt server cross-path FEC: %w", err)
 		}
+		// Point every WAN's codec slot at the shared cross-path codec
+		// (mirror NewClient's cross-path wiring). Otherwise recvLoop
+		// keeps feeding frames into the OLD per-WAN decoder, whose
+		// params are not cross-path: a block's frames that arrived over
+		// different WANs would be keyed by this WAN's path and never
+		// reassemble -> 100% loss even on a clean link (found on the
+		// VPS matrix: client started adaptive, server announced
+		// crosspath).
+		for _, wan := range c.wans {
+			wan.enc = c.xenc
+			wan.dec = c.xdec
+		}
 	} else {
 		// Per-WAN codecs (adaptive/fixed/off), one per WAN.
 		for i, wan := range c.wans {
@@ -1171,6 +1183,11 @@ func (c *Client) fecTickLoop(ctx context.Context) {
 				// One shared codec: single flush for encoder and decoder.
 				c.sendCrossEncoded(xenc.Tick(now))
 				c.deliverToWG(c.delivery.Push(xdec.Tick(now)))
+				// Cross-path blocks arrive reordered across WANs; the
+				// delivery buffer's gap timer must be advanced here too,
+				// or pending frames never flush (per-path branch does the
+				// same below).
+				c.deliverToWG(c.delivery.Tick(now))
 			} else {
 				for _, wan := range c.wans {
 					c.codecMu.RLock()
