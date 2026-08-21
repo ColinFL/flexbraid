@@ -1,10 +1,13 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ColinFL/flexbraid/internal/crypto"
 )
 
 const sample = `
@@ -246,4 +249,66 @@ func loadString(s string) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// TestMaxLossPctDefaults: an enabled FEC block without max_loss_pct (or
+// with an explicit 0) must default to DefaultMaxLossPct, not slip through
+// validation only to crash the adaptive codec math at start (field-found:
+// "invalid fec max_loss_pct 0 (must be 0 < x < 100)").
+func TestMaxLossPctDefaults(t *testing.T) {
+	omit := strings.Replace(sample, "  max_loss_pct: 20\n", "", 1)
+	c, err := loadString(omit)
+	if err != nil {
+		t.Fatalf("adaptive FEC without max_loss_pct must load: %v", err)
+	}
+	if c.FEC.MaxLossPct != DefaultMaxLossPct {
+		t.Errorf("default max_loss_pct = %v, want %v", c.FEC.MaxLossPct, DefaultMaxLossPct)
+	}
+
+	zero := strings.Replace(sample, "  max_loss_pct: 20\n", "  max_loss_pct: 0\n", 1)
+	c, err = loadString(zero)
+	if err != nil {
+		t.Fatalf("adaptive FEC with max_loss_pct: 0 must load (defaulted): %v", err)
+	}
+	if c.FEC.MaxLossPct != DefaultMaxLossPct {
+		t.Errorf("max_loss_pct 0 -> %v, want default %v", c.FEC.MaxLossPct, DefaultMaxLossPct)
+	}
+
+	// A disabled FEC must leave max_loss_pct untouched (no default needed):
+	// baseline 0 + disabled -> stays 0.
+	disabled := strings.Replace(sample, "  max_loss_pct: 20\n", "", 1)
+	disabled = strings.Replace(disabled, "enabled: true", "enabled: false", 1)
+	c, err = loadString(disabled)
+	if err != nil {
+		t.Fatalf("disabled FEC must load: %v", err)
+	}
+	if c.FEC.MaxLossPct != 0 {
+		t.Errorf("disabled FEC max_loss_pct = %v, want 0 (untouched)", c.FEC.MaxLossPct)
+	}
+}
+
+// TestDeliveryMaxPendingMatchesReplayWindow pins the DESIGN §5 invariant:
+// the reorder-buffer bound must never exceed the anti-replay window, or a
+// multi-path link drops legitimate reordered frames as replays.
+func TestDeliveryMaxPendingMatchesReplayWindow(t *testing.T) {
+	if DeliveryMaxPending != crypto.DefaultReplayWindow {
+		t.Fatalf("DeliveryMaxPending (%d) != crypto.DefaultReplayWindow (%d) — "+
+			"the delivery buffer must be <= the anti-replay window (DESIGN §5)",
+			DeliveryMaxPending, crypto.DefaultReplayWindow)
+	}
+}
+
+func TestDeliveryMaxPendingRejectsOverReplayWindow(t *testing.T) {
+	delivery := func(maxPending int) string {
+		return strings.Replace(sample, "health:\n",
+			fmt.Sprintf("delivery:\n  max_pending: %d\nhealth:\n", maxPending), 1)
+	}
+	// At the bound it must load.
+	if _, err := loadString(delivery(DeliveryMaxPending)); err != nil {
+		t.Fatalf("max_pending == DeliveryMaxPending must load: %v", err)
+	}
+	// Just past it -> hard error (would silently drop reordered frames).
+	if _, err := loadString(delivery(DeliveryMaxPending + 1)); err == nil {
+		t.Error("max_pending above the anti-replay window must be rejected")
+	}
 }

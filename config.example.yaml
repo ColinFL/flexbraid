@@ -72,7 +72,9 @@ delivery:
   gap_timeout_ms: 100   # max head-of-line blocking when a frame is missing.
                         # Must cover the RTT skew between paths (cable+LTE
                         # mixes routinely need 100ms+).
-  max_pending: 4096     # reorder-buffer bound (BDP guard; drop-oldest)
+  max_pending: 4096     # reorder-buffer bound (BDP guard; drop-oldest).
+                        # Max 4096 = anti-replay window (DESIGN §5) — larger
+                        # would be dropped as replays on multi-path links.
 
 # --- health: monitoring & circuit breaker --------------------------------
 health:

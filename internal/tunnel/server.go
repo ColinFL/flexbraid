@@ -55,6 +55,11 @@ type pathState struct {
 	health        *health.Monitor
 	lastArrive    atomic.Int64 // last frame of ANY kind on this path (liveness)
 	lastKeepalive atomic.Int64 // last keepalive arrival (loss measurement)
+	// pathSeq is this client-path's monotonic counter for pass-through
+	// frames (stamped into BlockSeq under sendMu in sendToSession). The
+	// client derives raw per-path loss from gaps in it — the adaptive FEC
+	// trigger (Variant A, mirrors wanLink.pathSeq on the client).
+	pathSeq uint32
 }
 
 // sessState is the server's scheduling state for one client session.
@@ -629,6 +634,16 @@ func (s *Server) noteOversize(sess *session.ServerSession, n int) {
 		"session", fmt.Sprintf("%016x", uint64(sess.ID)), "bytes", n, "mtu", s.cfg.MTU)
 }
 
+// pathForAddr returns the path state for a client endpoint, or nil. It is
+// called from sendToSession (under sendMu) to stamp the per-path pass-through
+// counter; statesMu serializes the (brief) read.
+func (s *Server) pathForAddr(id session.ID, ua *net.UDPAddr) *pathState {
+	st := s.stateFor(id)
+	s.statesMu.Lock()
+	defer s.statesMu.Unlock()
+	return st.paths[ua.String()]
+}
+
 // pickPath selects the endpoint for one outbound FEC block (M3): the
 // per-session scheduler picks among healthy paths; when none are usable it
 // falls back to the last heard endpoint so a fully-degraded link keeps
@@ -675,6 +690,16 @@ func (s *Server) sendToSession(sess *session.ServerSession, frames []*frame.Fram
 			addr = s.pickCrossPath(sess)
 			if addr == nil {
 				continue
+			}
+		}
+		// Pass-through frames: stamp this path's monotonic counter into
+		// BlockSeq so the client can measure raw per-path loss under load
+		// (Variant A). Cross-path always codes, so FlagPassSeq only ever
+		// appears in the per-WAN branch.
+		if f.HasFlag(frame.FlagPassSeq) && addr != nil {
+			if ps := s.pathForAddr(sess.ID, addr); ps != nil {
+				f.BlockSeq = ps.pathSeq
+				ps.pathSeq++
 			}
 		}
 		plain, err := f.Encode()
@@ -736,8 +761,15 @@ func (s *Server) forwardDecoded(frames []*frame.Frame) {
 // per block picked path) and the shared decoder (client → server).
 func (s *Server) fecTickLoop(ctx context.Context) {
 	interval := s.fecParams.BlockTimeout / 2
-	if interval < time.Millisecond {
-		interval = time.Millisecond
+	if interval < 25*time.Millisecond {
+		// FEC off / tiny block timeout: the codecs are pass-through and
+		// (unlike the client) there is no delivery-buffer gap timer for
+		// this loop to drive, so a lazy 250ms tick just keeps the loop
+		// alive. The old 1ms clamp idled burned ~4% of a core with FEC
+		// disabled (measured on a field VM; same bug as the client's
+		// fecTickLoop). FEC mode is structural (reload requires restart),
+		// so the cadence never needs to change after start.
+		interval = 250 * time.Millisecond
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -802,6 +834,14 @@ func (s *Server) healthTickLoop(ctx context.Context) {
 						rate := float64(lost) / float64(lost+received)
 						if rate > 0 {
 							ps.health.ObserveInBand(rate)
+						}
+					}
+					// Raw per-path loss from pass-through frame counters
+					// (Variant A): the adaptive trigger under sustained
+					// load. Feeds the loss EWMA, no breaker fast-trip.
+					if rawLost, rawRecv := s.fecDec.TakePathStats(uint64(id), pathKey); rawRecv > 0 {
+						if rate := float64(rawLost) / float64(rawLost+rawRecv); rate > 0 {
+							ps.health.ObserveRaw(rate)
 						}
 					}
 					before := ps.health.State()

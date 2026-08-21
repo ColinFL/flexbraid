@@ -1,9 +1,11 @@
 # FlexBraid — Wire Protocol
 
-> **Status:** M1 implemented. The single-WAN data path (session, framing,
-> crypto, UDP transport) is working and tested; multi-WAN scheduling (M3) and
-> FEC (M2) are still being built. This document is the contract to build
-> against — changes must be reflected here.
+> **Status:** M0–M5.5 implemented. Single-WAN data path (session, framing,
+> crypto, UDP transport), FEC (M2), multi-WAN scheduler + health (M3),
+> cross-path FEC + FakeTCP/ICMP transports (M4), telemetry/reload (M5), and
+> the PFS key exchange + server-authoritative FEC/MTU announcement (M5.5)
+> are all implemented and tested. Wire version 0x02. This document is the
+> contract to build against — changes must be reflected here.
 
 ---
 
@@ -51,7 +53,9 @@ Header size (before payload): **28 bytes**. Tag: 16 bytes.
 
 ### Field notes
 - **magic** — `0x46 0x4C 0x58 0x42` (`FLXB`). Used to detect garbage/wrong key.
-- **version** — protocol version, currently `0x01`.
+- **version** — protocol version, currently `0x02`. Bumped from 0x01 when
+  the PFS key exchange and the server-authoritative FEC/MTU announcement
+  made 0x01 payloads incompatible (§7).
 - **flags**:
   - `0x01` `FEC_PARITY` — payload is FEC parity, not inner data.
   - `0x02` `KEEPALIVE` — no inner data; used for liveness/RTT probing.
@@ -59,15 +63,26 @@ Header size (before payload): **28 bytes**. Tag: 16 bytes.
   - `0x08` `FIRST` — first frame of a session (client key-exchange request).
   - `0x20` `KEX` — key-exchange ACK (server → client, M5.5 PFS; always set
     together with `CONTROL`).
+  - `0x40` `PASS_SEQ` — pass-through frame whose `block_seq` field carries a
+    **per-path monotonic frame counter** instead of a FEC block id (see
+    `block_seq` below; §5.1 pass-through telemetry). Never set on coded
+    (FEC) frames.
 - **session_id** — 64-bit random value chosen by the client. The server keys
   the tunnel by this and **ignores source IP/port changes** (the basis of
   seamless failover).
 - **seq** — global, monotonically increasing across **all** WANs. Basis for the
   server's delivery (reorder) buffer.
-- **block_seq** — identifies the FEC block a frame belongs to. Data and parity
-  frames of the same block share `block_seq`. Because **FEC blocks are built per
-  WAN** (§4), `block_seq` is scoped to one WAN; frames on different WANs may
-  reuse `block_seq` values.
+- **block_seq** — two meanings, distinguished by `flags`:
+  - **coded frames** (no `PASS_SEQ`): identifies the FEC block a frame
+    belongs to. Data and parity frames of the same block share `block_seq`.
+    Because **FEC blocks are built per WAN** (§4), `block_seq` is scoped to
+    one WAN; frames on different WANs may reuse `block_seq` values.
+  - **pass-through frames** (`PASS_SEQ` set): a per-path monotonic counter
+    stamped by the sender on each uncoded data frame. The receiver measures
+    **raw per-path loss** from gaps in it (e.g. counters `7, 9` → one frame
+    lost on that path). This is the in-band signal that keeps the adaptive
+    FEC trigger alive under sustained load, where keepalive probes would be
+    suppressed by traffic (§5.1).
 
 ---
 
@@ -171,6 +186,39 @@ rather than one gated behind block decoding (design §8.1).
 Sub-protocol message types are defined in code as `internal/frame` control
 messages; wire numbering is reserved here and documented there.
 
+### 5.1 Pass-through telemetry (raw per-WAN loss)
+
+**Motivation.** The adaptive FEC trigger needs a loss estimate on every path.
+Keepalive probes are the classic source — but under *sustained traffic* a
+missed probe is indistinguishable from a delayed PONG (the path is busy, not
+dead), so probes are deliberately suppressed (design §8.1, liveness-by-traffic).
+That leaves the adaptive encoder blind exactly when it is exercised hardest:
+a lossy-but-busy WAN at full load sees zero measured loss and stays uncoded.
+
+**Wire mechanism.** When the encoder is in *pass-through* (FEC disabled, or
+adaptive currently below its on-threshold), each emitted data frame carries
+`PASS_SEQ` and `block_seq` holds a **per-path monotonic counter** (stamped by
+the sender at the point the WAN is chosen — `sendLocked` on the client, the
+path pick on the server). The receiver's FEC decoder, which already keys its
+state by `(session, path)`, tracks the expected counter per path: a jump from
+`7` to `10` means frames `8` and `9` were lost *on that path*. No probing, no
+silence requirement — the signal is exact and instant under load.
+
+**Semantics by construction:**
+- counters are **per path**, so a gap is attributable to exactly one WAN, even
+  with arbitrary scheduler interleaving;
+- the first observed counter seeds the expectation (no phantom loss on the
+  first frame);
+- duplicates/reorders (counter ≤ expected) are ignored for loss;
+- coded frames never carry `PASS_SEQ` — `block_seq` remains the FEC block id.
+
+**Consumption.** The raw loss feeds the path's health EWMA via
+`health.Monitor.ObserveRaw` (loss estimate only — no breaker fast-trip, since
+raw loss is pre-FEC and the adaptive encoder is expected to repair it), and
+`Encoder.SetLossRate` turns coding on/off from it. Unrecovered block loss
+still drives the circuit breaker (`ObserveInBand`); the two signals are
+deliberately separate (design §15.6).
+
 ---
 
 ## 6. Security
@@ -188,6 +236,13 @@ messages; wire numbering is reserved here and documented there.
   frame in both directions uses it. Ephemeral keys die with the process, so a
   later PSK compromise cannot decrypt past sessions (forward secrecy), and a
   (dir, seq) nonce is never reused under the same key across sessions.
+- **Server-pushed parameters (M5.5):** the KEX_ACK payload additionally
+  carries a `ServerAnnounce` JSON block (config schema version + FEC geometry
+  + inner MTU), sealed under the base key — only a PSK holder can forge it.
+  The client rebuilds its codecs from these values **before** publishing the
+  session key, so no data frame ever rides mismatched FEC/MTU geometry. A
+  client must refuse servers that send no block ("server too old"); a server
+  must refuse clients that negotiate a session without adopting it.
 - **Authentication before state:** frames are AEAD-authenticated **before**
   the replay window is touched and before session state is created or
   updated. An unauthenticated attacker therefore cannot slide the replay

@@ -156,9 +156,25 @@ type Delivery struct {
 	GapTimeoutMS int `yaml:"gap_timeout_ms"`
 	// MaxPending caps the reorder buffer (BDP guard): frames beyond the
 	// cap are dropped oldest-first, so a stalled path cannot grow the
-	// buffer without bound. Default 4096.
+	// buffer without bound. Default 4096. Must be <= DeliveryMaxPending
+	// (the anti-replay window, DESIGN §5 invariant).
 	MaxPending int `yaml:"max_pending"`
 }
+
+// DeliveryMaxPending is the upper bound on delivery.max_pending. It must
+// never exceed the anti-replay window (crypto.DefaultReplayWindow = 4096):
+// frames the reorder buffer would still accept beyond that are dropped as
+// replays by the sliding window on a multi-path link, so a larger bound is
+// both useless and silently lossy. A watchdog test pins the two constants
+// together (config_test.go).
+const DeliveryMaxPending = 4096
+
+// DefaultMaxLossPct is the redundancy ceiling applied when an enabled FEC
+// block omits max_loss_pct (or sets it to 0). Adaptive coding sizes parity
+// up to this bound; validation used to accept 0 but the codec math requires
+// (0,100), which crashed adaptive servers at startup (observed on a field
+// netem run). A deliberately low ceiling can still be configured (1–90).
+const DefaultMaxLossPct = 20
 
 // FEC configures forward error correction. It can be fully disabled.
 type FEC struct {
@@ -347,8 +363,9 @@ func (c *Config) Validate() error {
 	if c.Delivery.MaxPending == 0 {
 		c.Delivery.MaxPending = 4096
 	}
-	if c.Delivery.MaxPending < 64 || c.Delivery.MaxPending > 1<<20 {
-		return fmt.Errorf("delivery.max_pending must be in [64,1048576], got %d", c.Delivery.MaxPending)
+	if c.Delivery.MaxPending < 64 || c.Delivery.MaxPending > DeliveryMaxPending {
+		return fmt.Errorf("delivery.max_pending must be in [64,%d] (= anti-replay window, DESIGN §5), got %d",
+			DeliveryMaxPending, c.Delivery.MaxPending)
 	}
 
 	if c.MTU == 0 {
@@ -380,8 +397,14 @@ func (c *Config) Validate() error {
 		if c.FEC.Mode == FECCrosspath && c.Scheduler.Affinity != AffinityPacket {
 			return fmt.Errorf("fec.mode=crosspath requires scheduler.affinity=packet")
 		}
+		if c.FEC.MaxLossPct == 0 {
+			// Adaptive/fixed need a real ceiling; 0 meant "unset" but the
+			// codec math rejects it (must be 0 < x < 100) — an adaptive
+			// server without max_loss_pct crashed at startup. Default it.
+			c.FEC.MaxLossPct = DefaultMaxLossPct
+		}
 		if c.FEC.MaxLossPct < 0 || c.FEC.MaxLossPct > 90 {
-			return fmt.Errorf("fec.max_loss_pct must be in [0,90], got %v", c.FEC.MaxLossPct)
+			return fmt.Errorf("fec.max_loss_pct must be in (0,90], got %v", c.FEC.MaxLossPct)
 		}
 		if c.FEC.BlockTimeoutMS <= 0 {
 			c.FEC.BlockTimeoutMS = 8

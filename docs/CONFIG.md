@@ -5,10 +5,10 @@ Every setting has a sane default; you only need to write what differs.
 Unknown keys are a hard error (`KnownFields`), so a typo never silently
 disables a feature.
 
-> **Status:** M4.1 (cross-path FEC) and M4.2a (FakeTCP transport)
-> implemented on top of M3 (multi-WAN scheduler + health): per-WAN socket
-> binding, in-band loss telemetry, silence watchdog, live-adaptive and
-> cross-path FEC, `udp` + `faketcp` wire formats.
+> **Status:** M0–M5.5 implemented: per-WAN socket binding, in-band loss
+> telemetry, silence watchdog, live-adaptive and cross-path FEC, `udp` +
+> `faketcp` + `icmp` wire formats, PFS key exchange, and server-pushed
+> FEC/MTU parameters (the client config no longer carries them).
 
 ## Server-pushed parameters (FEC + MTU)
 
@@ -260,7 +260,10 @@ TCP tolerate the resulting reorder far better than a stalled stream).
   Trade-off: larger window = more added latency on gaps. Range 10–5000.
 - `max_pending` — the buffer is bounded (BDP guard): beyond it the
   longest-waiting frame is dropped, so a stalled path cannot grow memory
-  without bound. Range 64–1 048 576.
+  without bound. **Range 64–4096.** The cap can never exceed the anti-replay
+  window (also 4096): frames the buffer would still accept beyond that are
+  dropped by the replay filter as duplicates, so a larger window is both
+  useless and silently lossy (design §5 invariant, enforced at validation).
 
 ---
 

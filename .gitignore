@@ -8,6 +8,8 @@
 *.test
 *.out
 coverage.*
+__pycache__/
+*.pyc
 
 # Editor / OS
 .idea/

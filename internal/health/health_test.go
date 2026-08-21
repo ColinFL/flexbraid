@@ -201,6 +201,26 @@ func TestInBandImmediateDegrade(t *testing.T) {
 	}
 }
 
+// TestObserveRawDoesNotTripBreaker (Variant A): raw pass-through loss feeds
+// the loss EWMA (so the adaptive encoder sees it) but must NOT fast-trip the
+// circuit breaker the way unrecovered in-band loss does — raw loss is pre-FEC
+// and the encoder is expected to repair it. Two bad raw windows must leave
+// the path HEALTHY (the normal degrade hysteresis via Tick still applies).
+func TestObserveRawDoesNotTripBreaker(t *testing.T) {
+	m := New(fastOpts())
+	m.ObserveRaw(0.5) // above capacity but raw (= pre-FEC)
+	if m.State() != StateHealthy {
+		t.Fatalf("raw loss must not fast-trip the breaker: %v", m.State())
+	}
+	m.ObserveRaw(0.5) // still no fast-trip
+	if m.State() != StateHealthy {
+		t.Fatalf("two raw bad windows must NOT degrade (unrecovered-only): %v", m.State())
+	}
+	if m.Loss() <= 0.3 {
+		t.Fatalf("raw loss must still raise the loss EWMA (encoder feed): loss=%v", m.Loss())
+	}
+}
+
 // TestDownGraceDebounce: with DownGrace set, the DOWN transition waits for
 // the debounce window after the missed-probe threshold; without it the
 // transition is immediate (TestMissedProbesMarkDown).

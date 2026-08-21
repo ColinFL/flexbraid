@@ -584,3 +584,143 @@ func TestParitySubHeaderSelfDescribes(t *testing.T) {
 		t.Error("parity shard not stored")
 	}
 }
+
+// TestPassSeqTelemetry is the Variant A unit test: the adaptive encoder,
+// when it is NOT coding (pass-through), marks every frame with FlagPassSeq;
+// the sender stamps BlockSeq with a per-path counter; the decoder measures
+// RAW per-path loss from gaps in that counter via TakePathStats — the signal
+// that works under sustained load where keepalive probes are suppressed.
+func TestPassSeqTelemetry(t *testing.T) {
+	// Adaptive codec with coding ON-threshold far above what we'll feed
+	// (so the encoder stays pass-through and every frame gets FlagPassSeq).
+	params := adaptiveTestParams(0.0) // OnLossPct 2%
+	enc, err := NewEncoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := NewDecoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Feed 10 frames: encoder must pass them through flagged.
+	var sent []*frame.Frame
+	for i := 0; i < 10; i++ {
+		out := enc.Push(&frame.Frame{SessionID: testSession, Seq: uint32(i + 1), Payload: []byte{1}})
+		if len(out) != 1 {
+			t.Fatalf("pass-through frame %d: got %d frames, want 1", i, len(out))
+		}
+		sent = append(sent, out...)
+	}
+	for i, f := range sent {
+		if !f.HasFlag(frame.FlagPassSeq) {
+			t.Fatalf("frame %d missing FlagPassSeq (pass-through must mark)", i)
+		}
+	}
+
+	// Simulate the sender stamping a per-path counter (BlockSeq 1..10) and
+	// the network LOSING every 3rd frame on this path (counters 2, 5, 8).
+	// Decoder = client side: per-WAN decoder, gap in its own path.
+	path := "wan1"
+	dropped := map[uint32]bool{2: true, 5: true, 8: true}
+	for i, f := range sent {
+		f.BlockSeq = uint32(i + 1)
+		if dropped[f.BlockSeq] {
+			continue
+		}
+		dec.Push(path, f)
+	}
+	// Loss is booked only after the reorder window ages the gap (Variant A):
+	// three flushed gaps (counters 2, 5, 8) need three ageing rounds.
+	for i := 0; i < 3; i++ {
+		time.Sleep(pathGapWindow + 20*time.Millisecond)
+		dec.Tick(time.Now())
+	}
+	lost, received := dec.TakePathStats(testSession, path)
+	if lost != 3 {
+		t.Errorf("raw lost = %d, want 3", lost)
+	}
+	// First-frame seeding: 10 sent, 3 lost, 7 received (the seeded frame
+	// itself is received; no phantom loss on the first observation).
+	if received != 7 {
+		t.Errorf("raw received = %d, want 7", received)
+	}
+	// Reset-and-zero: a second take with no traffic returns zeros.
+	if l2, r2 := dec.TakePathStats(testSession, path); l2 != 0 || r2 != 0 {
+		t.Errorf("take-after-reset = %d/%d, want 0/0", l2, r2)
+	}
+}
+
+// TestPassSeqReorderNotLoss — the guard that stopped the false DEGRADED on
+// the field rig: counters arriving out of order by ≤ pathGapWindow (jitter
+// reorder, NOT loss) must not be booked as lost.
+func TestPassSeqReorderNotLoss(t *testing.T) {
+	params := adaptiveTestParams(0.0)
+	dec, err := NewDecoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "wan1"
+	// Arrive order: 1, 3, 2, 5, 4 — pure reorder (1, 2), (4, 5) swapped.
+	order := []uint32{1, 3, 2, 5, 4}
+	for _, c := range order {
+		f := &frame.Frame{SessionID: testSession, Seq: uint32(c), Flags: frame.FlagPassSeq}
+		f.BlockSeq = c
+		dec.Push(path, f)
+	}
+	// Nothing is lost: let the window expire and the pending counters drain.
+	time.Sleep(pathGapWindow + 20*time.Millisecond)
+	dec.Tick(time.Now())
+	lost, received := dec.TakePathStats(testSession, path)
+	if lost != 0 {
+		t.Errorf("reorder booked as loss: lost=%d, want 0", lost)
+	}
+	if received != 5 {
+		t.Errorf("received=%d, want 5 (all frames arrived, reordered)", received)
+	}
+	// A REAL gap is still caught: counter 2 missing, 3..5 arrive late.
+	dec2, _ := NewDecoder(params)
+	for _, c := range []uint32{1, 3, 4, 5} {
+		f := &frame.Frame{SessionID: testSession, Seq: uint32(c), Flags: frame.FlagPassSeq}
+		f.BlockSeq = c
+		dec2.Push(path, f)
+	}
+	time.Sleep(pathGapWindow + 20*time.Millisecond)
+	dec2.Tick(time.Now())
+	lost, received = dec2.TakePathStats(testSession, path)
+	if lost != 1 {
+		t.Errorf("real gap lost=%d, want 1 (counter 2)", lost)
+	}
+	if received != 4 {
+		t.Errorf("real gap received=%d, want 4", received)
+	}
+}
+
+// TestPassSeqReconstructionPreserved ensures FlagPassSeq frames pass through
+// the decoder intact (payload preserved, delivered immediately) and that
+// coded frames are NOT marked — pass-through telemetry must never confuse
+// the FEC decoder's block reassembly.
+func TestPassSeqReconstructionPreserved(t *testing.T) {
+	params := adaptiveTestParams(0.0)
+	enc, err := NewEncoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := NewDecoder(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pass-through frames carry their payload through untouched.
+	f := &frame.Frame{SessionID: testSession, Seq: 1, Payload: []byte("hello")}
+	out := enc.Push(f)
+	if len(out) != 1 || !out[0].HasFlag(frame.FlagPassSeq) {
+		t.Fatalf("pass-through emit: got %d frames flagged=%v", len(out), out[0].HasFlag(frame.FlagPassSeq))
+	}
+	delivered := dec.Push("wan1", out[0])
+	if len(delivered) != 1 {
+		t.Fatalf("pass-through delivery: got %d frames, want 1", len(delivered))
+	}
+	if string(delivered[0].Payload) != "hello" {
+		t.Errorf("payload mangled: %q", delivered[0].Payload)
+	}
+}

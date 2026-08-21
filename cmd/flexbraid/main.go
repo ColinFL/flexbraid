@@ -27,7 +27,11 @@ import (
 	"github.com/ColinFL/flexbraid/internal/tunnel"
 )
 
-var version = "0.1.0-m5"
+// version is the FlexBraid release version. It is injected at build time
+// via -ldflags "-X main.version=<v>"; the Makefile is the single source of
+// truth for release versions. Unversioned dev builds (plain `go build`)
+// report "dev" rather than a stale milestone string.
+var version = "dev"
 
 // parseLevel maps the config's log.level string to a slog.Level.
 func parseLevel(s string) slog.Level {

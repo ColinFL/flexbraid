@@ -260,17 +260,18 @@ func (e *Encoder) Push(f *frame.Frame) []*frame.Frame {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.params.Enabled() {
-		return []*frame.Frame{f}
+		return markPassSeq([]*frame.Frame{f})
 	}
 	e.refreshLocked(time.Now())
 	if !e.codingOn {
 		// Pass-through: flush anything left over from a coding period
 		// (frames that never reached k or a timeout) un-stamped, then the
-		// current frame. block_seq=0 tells the decoder to deliver at once.
+		// current frame. block_seq is stamped by the sender with a per-path
+		// counter and FlagPassSeq tells the decoder to deliver at once.
 		out := e.pending
 		e.pending = nil
 		out = append(out, f)
-		return out
+		return markPassSeq(out)
 	}
 	if len(e.pending) == 0 {
 		e.blockStart = time.Now()
@@ -280,6 +281,17 @@ func (e *Encoder) Push(f *frame.Frame) []*frame.Frame {
 		return nil
 	}
 	return e.emitBlock()
+}
+
+// markPassSeq flags each frame as a pass-through frame: the sender must
+// stamp BlockSeq with a per-path monotonic counter before sealing (the
+// receiver measures raw, per-WAN loss from gaps in that counter — the
+// adaptive trigger that works under sustained load).
+func markPassSeq(frames []*frame.Frame) []*frame.Frame {
+	for _, f := range frames {
+		f.Flags |= frame.FlagPassSeq
+	}
+	return frames
 }
 
 // Tick flushes a short block whose fill time exceeded BlockTimeout. It
@@ -440,7 +452,31 @@ type Decoder struct {
 	stats map[streamKey]streamStat
 	// recovered counts data frames reconstructed from parity (telemetry).
 	recovered atomic.Uint64
+	// pathSeq tracks per-stream pass-through PathSeq counters (FlagPassSeq
+	// frames): the next expected counter per (session, path) and the raw
+	// loss/received deltas for TakePathStats. Raw, works under load.
+	pathSeq map[streamKey]rawPathStat
 }
+
+// rawPathStat is the raw per-path pass-through telemetry: the next expected
+// PathSeq counter, pending out-of-order candidates, and the deltas since the
+// last TakePathStats. A gap is only booked as LOSS after pathGapWindow (a
+// reorder window): with netem/jitter a counter can legitimately arrive out
+// of order by up to the jitter span, and counting that as loss would rachet
+// the health EWMA into a false DEGRADED/DOWN.
+type rawPathStat struct {
+	next     uint64
+	received uint64
+	lost     uint64
+	pending  map[uint64]struct{} // counters > next seen so far (reorder candidates)
+	gapSince time.Time           // when next went missing (zero = no gap)
+}
+
+// pathGapWindow is how long "next" may be absent before a counter gap counts
+// as real loss. Must exceed the max inter-path reorder span (netem jitter
+// here is 10ms on a 30ms delay → worst reorder ≈ 20ms), while staying well
+// under probe/keepalive sensitivity so raw loss still reacts quickly.
+const pathGapWindow = 40 * time.Millisecond
 
 // rsFor returns (caching) an RS encoder for the block's actual shard count.
 func (d *Decoder) rsFor(k, p int) reedsolomon.Encoder {
@@ -465,7 +501,120 @@ func NewDecoder(p Params) (*Decoder, error) {
 	}
 	return &Decoder{params: p, blocks: make(map[blockKey]*blockState),
 		rsByParity:  make(map[int]reedsolomon.Encoder),
-		lastFlushed: make(map[streamKey]uint32), stats: make(map[streamKey]streamStat)}, nil
+		lastFlushed: make(map[streamKey]uint32), stats: make(map[streamKey]streamStat),
+		pathSeq: make(map[streamKey]rawPathStat)}, nil
+}
+
+// observePathSeq records one pass-through frame's PathSeq on its stream.
+// Stream counters are expected to arrive in order; a counter BELOW the next
+// expected is a duplicate (ignored), one ABOVE is held as a reorder
+// candidate — a monotic counter can legitimately arrive out of order by up
+// to the jitter span, and only a gap that survives pathGapWindow counts as
+// loss (see flushPathGaps). The first observed counter seeds the stream
+// without counting anything.
+func (d *Decoder) observePathSeq(sessionID uint64, path string, seq uint32) {
+	sk := streamKey{sessionID: sessionID, path: path}
+	ps := d.pathSeq[sk]
+	if ps.pending == nil {
+		ps.pending = make(map[uint64]struct{})
+	}
+	next := uint64(seq)
+	if ps.next == 0 {
+		// First observation: seed without counting.
+		ps.next = next + 1
+		ps.received++
+		d.pathSeq[sk] = ps
+		return
+	}
+	if next < ps.next {
+		return // duplicate / already accounted
+	}
+	if next == ps.next {
+		ps.received++
+		ps.next = next + 1
+		d.drainPathPending(&ps)
+		if len(ps.pending) == 0 {
+			ps.gapSince = time.Time{}
+		}
+		d.pathSeq[sk] = ps
+		return
+	}
+	// next > ps.next: a reorder candidate (or a future loss — decided by
+	// the timer in flushPathGaps).
+	if _, dup := ps.pending[next]; !dup {
+		ps.pending[next] = struct{}{}
+	}
+	if ps.gapSince.IsZero() {
+		ps.gapSince = time.Now()
+	}
+	d.pathSeq[sk] = ps
+}
+
+// drainPathPending consumes the run of contiguous counters starting at
+// ps.next once the stream order resumes.
+func (d *Decoder) drainPathPending(ps *rawPathStat) {
+	for {
+		if _, ok := (*ps).pending[(*ps).next]; !ok {
+			return
+		}
+		delete((*ps).pending, (*ps).next)
+		(*ps).received++
+		(*ps).next++
+	}
+}
+
+// flushPathGaps ages reorder candidates: any counter that is STILL missing
+// after pathGapWindow is a real loss (a reorder candidate would have arrived
+// within the window). Called from Tick with the decoder lock held.
+func (d *Decoder) flushPathGaps(now time.Time) {
+	for sk, ps := range d.pathSeq {
+		if ps.next == 0 || ps.gapSince.IsZero() {
+			continue
+		}
+		if now.Sub(ps.gapSince) < pathGapWindow {
+			continue
+		}
+		// A gap of ≥1 counter persisted: book it as lost and move the
+		// expectation to the lowest pending candidate (if any).
+		if len(ps.pending) == 0 {
+			ps.lost++
+			ps.next++
+			ps.gapSince = time.Time{}
+			d.pathSeq[sk] = ps
+			continue
+		}
+		lo := ^uint64(0)
+		for c := range ps.pending {
+			if c < lo {
+				lo = c
+			}
+		}
+		ps.lost += lo - ps.next
+		ps.next = lo
+		d.drainPathPending(&ps)
+		if len(ps.pending) == 0 {
+			ps.gapSince = time.Time{}
+		} else {
+			ps.gapSince = now
+		}
+		d.pathSeq[sk] = ps
+	}
+}
+
+// TakePathStats returns and resets the raw per-path pass-through deltas for
+// one stream (session, path): raw loss and raw received frames since the
+// last call. loss/(loss+received) is the raw path loss rate the health
+// monitor feeds the adaptive encoder — unlike unrecovered stream loss it is
+// visible under sustained load, where probes are suppressed.
+func (d *Decoder) TakePathStats(sessionID uint64, path string) (lost, received uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	sk := streamKey{sessionID: sessionID, path: path}
+	ps := d.pathSeq[sk]
+	lost, received = ps.lost, ps.received
+	ps.lost, ps.received = 0, 0
+	d.pathSeq[sk] = ps
+	return lost, received
 }
 
 // Push accepts a data or parity frame of a stream (session+path) and returns
@@ -477,6 +626,15 @@ func NewDecoder(p Params) (*Decoder, error) {
 func (d *Decoder) Push(path string, f *frame.Frame) []*frame.Frame {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// Pass-through frame with a per-path counter: measure raw loss from
+	// gaps in the counter and deliver immediately. Unlike FEC blocks this
+	// signal exists under sustained load, where keepalive probes are
+	// suppressed by traffic — this is what lets the adaptive encoder turn
+	// on (Variant A, docs/DESIGN.md §15.6).
+	if f.HasFlag(frame.FlagPassSeq) && !f.HasFlag(frame.FlagFECParity) {
+		d.observePathSeq(f.SessionID, path, f.BlockSeq)
+		return []*frame.Frame{f}
+	}
 	if !d.params.Enabled() {
 		// Pass-through: an FEC-less decoder must still not leak the
 		// sender's parity frames into the inner stream.
@@ -539,6 +697,10 @@ func (d *Decoder) Push(path string, f *frame.Frame) []*frame.Frame {
 func (d *Decoder) Tick(now time.Time) []*frame.Frame {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// Age pass-through reorder candidates into loss deltas (Variant A
+	// telemetry). Run regardless of FEC params: pass-through framing is
+	// used both when FEC is off and when the adaptive encoder is idle.
+	d.flushPathGaps(now)
 	if !d.params.Enabled() {
 		return nil
 	}

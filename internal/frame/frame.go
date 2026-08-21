@@ -15,8 +15,13 @@ import (
 const (
 	// Magic identifies FlexBraid frames ("FLXB", big-endian).
 	Magic = 0x464C5842
-	// Version is the current wire protocol version.
-	Version = 0x01
+	// Version is the current wire protocol version. 0x02 since the M5.5 PFS
+	// key exchange and the server-authoritative FEC/MTU announcement
+	// (KEX_ACK ServerAnnounce): both made the payload incompatible with 0x01
+	// peers, which would otherwise fail cryptically mid-session instead of
+	// being refused at the header check. Bump this on every wire-breaking
+	// change (see docs/PROTOCOL.md §7).
+	Version = 0x02
 	// HeaderSize is the size of the frame header in bytes.
 	HeaderSize = 28
 	// TagSize is the size of the AEAD auth tag appended after the payload.
@@ -42,10 +47,19 @@ const (
 	// the base (PSK) key so the client can read it before the session key
 	// exists.
 	FlagKex uint8 = 1 << 5
+	// FlagPassSeq marks a pass-through (uncoded) frame whose BlockSeq field
+	// carries a per-path monotonic frame counter instead of a FEC block
+	// id. The receiver counts gaps in that counter per path — the raw,
+	// per-WAN loss signal that works under sustained load, where keepalive
+	// probes are suppressed by traffic (design: docs/DESIGN.md §15.x,
+	// adaptive trigger). Zero in coded frames.
+	FlagPassSeq uint8 = 1 << 6
 )
 
 // Frame is a decoded or to-be-encoded frame. Payload holds the plaintext
 // inner datagram (or control data); the auth tag is owned by the crypto layer.
+// For pass-through frames (FlagPassSeq set) BlockSeq holds a per-path frame
+// counter; for coded frames it holds the FEC block id.
 type Frame struct {
 	Version   uint8
 	Flags     uint8

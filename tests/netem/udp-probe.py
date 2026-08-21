@@ -5,7 +5,7 @@ path) plus RTT stats.
 
 Usage: udp-probe.py <listen-host> <listen-port> <count> [interval-ms]
 
-Prints one line:  sent=<n> received=<n> loss=<pct> min=<ms> avg=<ms> max=<ms>
+Prints one line:  sent=<n> received=<n> loss=<pct>% min=<ms> avg=<ms> max=<ms>
 """
 import socket
 import sys
@@ -42,7 +42,8 @@ def fmt(v):
 if rtt:
     rtt.sort()
     avg = sum(rtt) / len(rtt)
-    print(f"sent={count} received={received} loss={(count - received) / count * 100.0:.1f} "
+    print(f"sent={count} received={received} "
+          f"loss={(count - received) / count * 100.0:.1f}% "
           f"min={fmt(rtt[0])} avg={fmt(avg)} max={fmt(rtt[-1])}")
 else:
-    print(f"sent={count} received=0 loss=100.0 min=- avg=- max=-")
+    print(f"sent={count} received=0 loss=100.0% min=- avg=- max=-")

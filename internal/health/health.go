@@ -278,6 +278,23 @@ func (m *Monitor) ObserveInBand(lossRate float64) {
 	}
 }
 
+// ObserveRaw feeds the monitor's loss EWMA directly from the RAW per-path
+// loss (pass-through frame-counter gaps, Variant A). Unlike ObserveInBand it
+// does not fast-trip the circuit breaker (inBandBad): raw loss is pre-FEC
+// and the adaptive encoder is expected to repair it — only UNRECOVERED loss
+// means the path is beyond FEC capacity and should be dropped from rotation.
+// The normal Healthy→Degraded hysteresis (degrade_sec above the cap) still
+// applies, since m.loss is what tickLocked compares against maxLoss.
+func (m *Monitor) ObserveRaw(lossRate float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lossRate > m.loss {
+		m.loss += m.alphaFast * (lossRate - m.loss)
+	} else {
+		m.loss += m.alphaSlow * (lossRate - m.loss)
+	}
+}
+
 // Tick advances the state machine. Call it from the tunnel's ticker.
 func (m *Monitor) Tick(now time.Time) {
 	m.mu.Lock()

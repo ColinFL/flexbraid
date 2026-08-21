@@ -387,13 +387,28 @@ The health monitor is the "self-contained WANFAIL" — FlexBraid decides link
 state from its **own** traffic, no OPNsense dependency.
 
 ### 8.1 Per-path metrics
-- **Loss** — derived from gaps in the received `seq` stream (passive) and from
-  keepalive echoes (active).
+- **Loss** — derived from:
+  - **keepalive echoes** (active): a probe is counted missed only when the
+    path is *silent* since the probe was sent (liveness-by-traffic) — busy
+    paths never produce false misses (§PROTOCOL 5.1);
+  - **FEC decoder unrecovered loss** (in-band, post-FEC): frames lost even
+    after reconstruction — the circuit-breaker signal (§PROTOCOL §5);
+  - **pass-through counter gaps** (in-band, raw, pre-FEC): every uncoded
+    frame carries a per-path monotonic counter; gaps = raw loss on that
+    exact path, measured **under sustained load** where probes are
+    suppressed. This is the adaptive FEC trigger (§15.6).
 - **RTT** — from timestamps echoed in `CONTROL`/`KEEPALIVE` frames, which are
   sent **directly on the path and bypass FEC** (§5), so the sample is a clean
   round-trip time, not one gated behind block decoding.
 - **Jitter** — EWMA of inter-arrival time variance (games die on jitter before
   loss).
+
+> **Two loss signals, two jobs.** Raw loss (`ObserveRaw` from pass-through
+> counters) feeds the adaptive **encoder** so it codes when the wire is lossy
+> — even at full load. Unrecovered loss (`ObserveInBand` from block flushes)
+> feeds the **circuit breaker**: only a path FEC *cannot* repair should be
+> dropped from rotation. Mixing them would both blind the encoder under load
+> and slam the breaker on every recoverable blip (§15.6).
 
 ### 8.2 Exponential weighting ("fast rise, slow decay")
 Two EWMA filters per path:
@@ -605,3 +620,38 @@ Full reference in [CONFIG.md](CONFIG.md). Highlights:
   session survival; assert `recover_min` re-add behaviour; assert a
   load-balanced session keeps both WAN endpoints active and answers on the
   correct path.
+
+### 15.6 Pass-through telemetry = the adaptive FEC trigger (Variant A)
+
+**Problem found in the field.** Live-adaptive FEC (M4) sizes parity from the
+measured loss and runs pass-through on clean links. Its trigger used two
+signals, both blind under sustained load: keepalive probes are suppressed by
+liveness-by-traffic (§8.1), and the decoder's unrecovered-loss counter only
+exists for *coded* blocks — pass-through produces none. Result: a lossy-but-
+busy WAN measured 0% loss, `SetLossRate(0)` kept the encoder in pass-through,
+and 5% netem loss sailed through with zero FEC protection (A/B on the field
+rig: `fixed` recovered to 0.6% loss, `adaptive` stayed at ~10%).
+
+**Design.** The sender stamps every *uncoded* frame with a per-path monotonic
+counter (`PASS_SEQ`, filling `block_seq` — wire §2/§5.1). The receiver's FEC
+decoder, already keyed by `(session, path)`, tracks the expected counter per
+path: counter jumps are exactly the frames lost *on that path*, measured
+receiver-side, without any probe, valid under full load. Two loss signals are
+then kept separate (§8.1):
+
+- `ObserveRaw(counter-gap loss)` → health loss EWMA → `SetLossRate` — turns
+  adaptive coding on/off;
+- `ObserveInBand(unrecovered block loss)` → circuit breaker — drops a path
+  only when FEC *cannot* repair it.
+
+**Why it is correct.** Per-path counters make attribution exact even under
+arbitrary scheduler interleaving (each WAN has its own counter); the first
+observed counter seeds expectation (no phantom loss); reorders/duplicates are
+ignored. Coding caps parity by `max_loss_pct` regardless. The change is
+wire-visible (new flag bit 0x40, same 0x02 version) and therefore must ship
+peer-locked — documented in PROTOCOL §5.1.
+
+**Verification.** Unit: `TestPassSeqTelemetry`, `TestPassSeqReconstruction
+Preserved` (fec). Field: netem harness — the FEC-on load pass (previously
+red, stating the bug) is green again after the fix; A/B `fixed` vs `adaptive`
+under 5% netem + 20 Mbit/s now agree.
